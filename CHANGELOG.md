@@ -10,6 +10,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **XHTTP `stream-up` over HTTP/2** — VLESS can upload with POST and
+  download with GET using one shared session ID. Supports path or header
+  sessions, `session-table: Base62`, bounded `session-length`, and
+  `x-padding-obfs-mode` with `tokenish` / `repeat-x` padding in a header
+  or `queryInHeader`. Response headers stay deferred so CDN buffering
+  cannot deadlock the first payload write; both response streams drain
+  within the existing bounded connection-driver cleanup window.
+  HTTP/3 and unsupported session/padding placements fail explicitly.
+  See [XHTTP compatibility](docs/xhttp.md) for the supported options.
+
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
   file-descriptor soft limit toward the hard limit (≤ 65536) before any
   listener or outbound socket is created, matching the precedent the

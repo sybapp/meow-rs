@@ -1804,6 +1804,18 @@ fn parse_vless(
             chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
         }
         "xhttp" => {
+            if config
+                .get("alpn")
+                .and_then(serde_yaml::Value::as_sequence)
+                .is_some_and(|protocols| {
+                    protocols
+                        .iter()
+                        .filter_map(serde_yaml::Value::as_str)
+                        .any(|protocol| protocol == "h3" || protocol.starts_with("h3-"))
+                })
+            {
+                return Err("vless: XHTTP over HTTP/3 is not implemented; use alpn: [h2]".into());
+            }
             let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
             chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
         }
@@ -2085,6 +2097,26 @@ fn parse_vless_xhttp_config(
     use meow_transport::xhttp::{XhttpConfig, MAX_EXTRA_HEADERS, MAX_X_PADDING_BYTES};
 
     let xhttp_opts = config.get("xhttp-opts");
+    if xhttp_opts.is_some_and(|opts| !opts.is_mapping()) {
+        return Err("vless: xhttp-opts must be a mapping".into());
+    }
+    let string_option = |key: &str, default: &str| -> std::result::Result<String, String> {
+        match xhttp_opts.and_then(|opts| opts.get(key)) {
+            None => Ok(default.to_string()),
+            Some(value) => value
+                .as_str()
+                .map(std::string::ToString::to_string)
+                .ok_or_else(|| format!("vless: xhttp-opts.{key} must be a string")),
+        }
+    };
+    let bool_option = |key: &str, default: bool| -> std::result::Result<bool, String> {
+        match xhttp_opts.and_then(|opts| opts.get(key)) {
+            None => Ok(default),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("vless: xhttp-opts.{key} must be a boolean")),
+        }
+    };
     let path = xhttp_opts
         .and_then(|o| o.get("path"))
         .and_then(|v| v.as_str())
@@ -2117,14 +2149,10 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    let mode = xhttp_opts
-        .and_then(|o| o.get("mode"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("stream-one")
-        .to_string();
-    if !mode.eq_ignore_ascii_case("stream-one") {
+    let mode = string_option("mode", "stream-one")?;
+    if !mode.eq_ignore_ascii_case("stream-one") && !mode.eq_ignore_ascii_case("stream-up") {
         return Err(format!(
-            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
+            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' and 'stream-up' are implemented"
         ));
     }
     let extra_headers: Vec<(String, String)> = match xhttp_opts
@@ -2151,10 +2179,7 @@ fn parse_vless_xhttp_config(
         }
         None => Vec::new(),
     };
-    let no_grpc_header = xhttp_opts
-        .and_then(|o| o.get("no-grpc-header"))
-        .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false);
+    let no_grpc_header = bool_option("no-grpc-header", false)?;
     let x_padding_bytes =
         if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
             if let Some(s) = padding_val.as_str() {
@@ -2222,7 +2247,36 @@ fn parse_vless_xhttp_config(
         }
     }
 
-    Ok(XhttpConfig {
+    let length = string_option("session-length", "16-32")?;
+    let (min, max) = length.split_once('-').unwrap_or((&length, &length));
+    let session_length = (
+        min.trim()
+            .parse::<usize>()
+            .map_err(|_| "vless: invalid session-length min".to_string())?,
+        max.trim()
+            .parse::<usize>()
+            .map_err(|_| "vless: invalid session-length max".to_string())?,
+    );
+    // These alter the wire format / destination. Until implemented, fail
+    // closed rather than load a node that dials using different semantics.
+    for key in [
+        "download-settings",
+        "download-config",
+        "uplink-http-method",
+        "uplink-data-placement",
+        "uplink-data-key",
+        "uplink-chunk-size",
+        "seq-placement",
+        "seq-key",
+        "sc-max-each-post-bytes",
+        "sc-min-posts-interval-ms",
+        "reuse-settings",
+    ] {
+        if xhttp_opts.is_some_and(|opts| opts.get(key).is_some()) {
+            return Err(format!("vless: xhttp-opts.{key} is not implemented"));
+        }
+    }
+    let parsed = XhttpConfig {
         path,
         hosts,
         scheme: if tls { "https" } else { "http" }.to_string(),
@@ -2230,7 +2284,20 @@ fn parse_vless_xhttp_config(
         mode,
         no_grpc_header,
         x_padding_bytes,
-    })
+        x_padding_obfs_mode: bool_option("x-padding-obfs-mode", false)?,
+        x_padding_method: string_option("x-padding-method", "")?,
+        x_padding_placement: string_option("x-padding-placement", "")?,
+        x_padding_header: string_option("x-padding-header", "")?,
+        x_padding_key: string_option("x-padding-key", "")?,
+        session_placement: string_option("session-placement", "path")?,
+        session_key: string_option("session-key", "")?,
+        session_table: string_option("session-table", "")?,
+        session_length,
+    };
+    parsed
+        .validate()
+        .map_err(|error| format!("vless: {error}"))?;
+    Ok(parsed)
 }
 
 /// Parse the VLESS `encryption` field.

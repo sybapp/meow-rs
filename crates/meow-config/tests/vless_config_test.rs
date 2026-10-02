@@ -1613,6 +1613,72 @@ proxies:
     let config = load_config_from_str(yaml).await.expect("config must parse");
     assert!(config.proxies.contains_key("vless-xhttp-full"));
 }
+
+#[tokio::test]
+async fn parse_vless_xhttp_stream_up_user_options() {
+    let yaml = r#"
+proxies:
+  - name: split
+    type: vless
+    server: 192.0.2.1
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    servername: example.org
+    alpn: [h2]
+    network: xhttp
+    xhttp-opts:
+      host: example.org
+      path: /api/v1/telemetry
+      mode: stream-up
+      x-padding-obfs-mode: true
+      x-padding-method: tokenish
+      x-padding-placement: header
+      x-padding-header: X-Cache-Key
+      x-padding-bytes: 128-512
+      no-grpc-header: true
+      session-placement: header
+      session-key: X-Session-Id
+      session-table: Base62
+      session-length: "16-24"
+"#;
+    let config = load_config_from_str(yaml).await.expect("config parses");
+    assert!(config.proxies.contains_key("split"));
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_invalid_split_options_skipped() {
+    for option in [
+        "session-length: '0-24'",
+        "session-length: '24-16'",
+        "session-length: '16-1000000000'",
+        "session-table: Base62\n      session-length: '1-2'",
+        "session-placement: cookie",
+        "session-table: unsupported",
+        "session-placement: header\n      session-key: 'has space'",
+        "x-padding-obfs-mode: 'true'",
+        "x-padding-obfs-mode: true\n      x-padding-method: unknown",
+        "x-padding-obfs-mode: true\n      x-padding-placement: header",
+        "x-padding-obfs-mode: true\n      x-padding-placement: cookie",
+        "x-padding-obfs-mode: true\n      x-padding-placement: header\n      x-padding-header: X-Session\n      session-placement: header",
+        "download-settings: {}",
+        "uplink-chunk-size: '1024'",
+        "mode: 123",
+    ] {
+        let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    xhttp-opts:\n      {option}\n");
+        let config = load_config_from_str(&yaml).await.expect("warn-and-skip load");
+        assert!(!config.proxies.contains_key("invalid"), "invalid option accepted: {option}");
+    }
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_h3_is_explicitly_unsupported() {
+    let yaml = "proxies:\n  - name: h3\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    alpn: [h3]\n    network: xhttp\n    xhttp-opts:\n      mode: stream-up\n";
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("warn-and-skip load");
+    assert!(!config.proxies.contains_key("h3"));
+}
 #[tokio::test]
 async fn parse_vless_xhttp_unsupported_mode_skipped() {
     let yaml = r#"

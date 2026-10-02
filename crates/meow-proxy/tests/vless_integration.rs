@@ -519,6 +519,15 @@ mod vless_tests {
 
     #[tokio::test]
     async fn vless_over_xhttp_roundtrip() {
+        vless_xhttp_roundtrip("stream-one").await;
+    }
+
+    #[tokio::test]
+    async fn vless_over_xhttp_stream_up_roundtrip() {
+        vless_xhttp_roundtrip("stream-up").await;
+    }
+
+    async fn vless_xhttp_roundtrip(mode: &'static str) {
         use bytes::Bytes;
         use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
 
@@ -537,7 +546,26 @@ mod vless_tests {
                         return;
                     };
 
+                    let mut download = None;
                     while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        if request.method() == http::Method::GET {
+                            assert_eq!(mode, "stream-up");
+                            download = Some((request.headers()["X-Session-Id"].clone(), respond));
+                            continue;
+                        }
+                        assert_eq!(request.method(), http::Method::POST);
+                        if mode == "stream-up" {
+                            let (session, download_response) =
+                                download.take().expect("GET precedes POST");
+                            assert_eq!(session, request.headers()["X-Session-Id"]);
+                            respond
+                                .send_response(
+                                    http::Response::builder().status(204).body(()).unwrap(),
+                                    true,
+                                )
+                                .unwrap();
+                            respond = download_response;
+                        }
                         // Send 200 OK response header lazily to start the bidirectional stream
                         let response = http::Response::builder().status(200).body(()).unwrap();
                         let mut send_body = respond.send_response(response, false).unwrap();
@@ -611,6 +639,11 @@ mod vless_tests {
         let xhttp_cfg = XhttpConfig {
             path: "/xhttp-vless".into(),
             hosts: vec!["xhttp.test.com".into()],
+            mode: mode.into(),
+            session_placement: "header".into(),
+            session_key: "X-Session-Id".into(),
+            session_table: "Base62".into(),
+            session_length: (16, 24),
             ..Default::default()
         };
         chain.push(Box::new(XhttpLayer::new(xhttp_cfg)));
