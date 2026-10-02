@@ -64,13 +64,25 @@ impl Xhttp3Client {
             .choose(&mut rand::rng())
             .expect("validated");
         let authority = xhttp::format_authority(host);
-        let split = self.config.mode.eq_ignore_ascii_case("stream-up");
+        let packet = self
+            .config
+            .effective_mode()
+            .eq_ignore_ascii_case("packet-up");
+        let split = packet
+            || self
+                .config
+                .effective_mode()
+                .eq_ignore_ascii_case("stream-up");
         let session = split.then(|| xhttp::generate_session(&self.config));
         let upload = headers(&xhttp::build_request(
             &self.config,
             &authority,
-            http::Method::POST,
+            self.config
+                .uplink_http_method
+                .parse()
+                .expect("validated method"),
             session.as_deref(),
+            true,
         )?)?;
         let download = if split {
             Some(headers(&xhttp::build_request(
@@ -78,6 +90,7 @@ impl Xhttp3Client {
                 &authority,
                 http::Method::GET,
                 session.as_deref(),
+                false,
             )?)?)
         } else {
             None
@@ -95,8 +108,28 @@ impl Xhttp3Client {
         let error = Arc::new(Mutex::new(None));
         let driver_error = Arc::clone(&error);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let packet_upload = packet.then(|| {
+            PacketUpload::new(
+                self.config.clone(),
+                authority,
+                session.expect("packet session"),
+            )
+        });
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            if let Err(e) = drive(conn, socket, local, peer, pump, upload, download, ready_tx).await
+            if let Err(e) = drive(
+                conn,
+                socket,
+                local,
+                peer,
+                pump,
+                upload,
+                download,
+                ready_tx,
+                packet_upload,
+                finished_tx,
+            )
+            .await
             {
                 *driver_error.lock().expect("driver error lock") = Some(e);
             }
@@ -119,6 +152,7 @@ impl Xhttp3Client {
             inner: app,
             error,
             task: Some(task),
+            finished: packet.then_some(finished_rx),
         }))
     }
 }
@@ -184,9 +218,12 @@ async fn drive(
     upload_headers: Vec<quiche::h3::Header>,
     download_headers: Option<Vec<quiche::h3::Header>>,
     ready: tokio::sync::oneshot::Sender<()>,
+    mut packet: Option<PacketUpload>,
+    finished: tokio::sync::oneshot::Sender<()>,
 ) -> io::Result<()> {
     let (mut app_read, mut app_write) = tokio::io::split(pump);
     let mut ready = Some(ready);
+    let mut finished = Some(finished);
     let mut keepalive = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(15),
         Duration::from_secs(15),
@@ -225,11 +262,13 @@ async fn drive(
                     .send_request(&mut conn, headers, true)
                     .map_err(quic_io)?;
             }
-            upload = http
-                .send_request(&mut conn, &upload_headers, false)
-                .map_err(quic_io)?;
-            if !split {
-                download = upload;
+            if packet.is_none() {
+                upload = http
+                    .send_request(&mut conn, &upload_headers, false)
+                    .map_err(quic_io)?;
+                if !split {
+                    download = upload;
+                }
             }
             header_deadline = Some(tokio::time::Instant::now() + HEADER_TIMEOUT);
             h3 = Some(http);
@@ -265,7 +304,9 @@ async fn drive(
                                 .ok()
                                 .and_then(|s| s.parse::<u16>().ok())
                                 .ok_or_else(|| quic_io("invalid response status"))?;
-                            let valid = if split && id == download {
+                            let valid = if (split && id == download)
+                                || (packet.is_some() && id == upload)
+                            {
                                 code == 200
                             } else {
                                 (200..300).contains(&code)
@@ -293,6 +334,9 @@ async fn drive(
                         if !got_upload_headers {
                             return Err(quic_io("upload ended without response headers"));
                         }
+                        if let Some(packet) = &mut packet {
+                            packet.ack_received = true;
+                        }
                     }
                     Ok((_, quiche::h3::Event::Reset(code))) => {
                         return Err(quic_io(format!("stream reset {code}")))
@@ -303,20 +347,91 @@ async fn drive(
                     Err(e) => return Err(quic_io(e)),
                 }
             }
-            if up_pos < up_len {
+            if packet.is_none() && up_pos < up_len {
                 match http.send_body(&mut conn, upload, &up[up_pos..up_len], false) {
                     Ok(n) => up_pos += n,
                     Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {}
                     Err(e) => return Err(quic_io(e)),
                 }
             }
-            if upload_fin && up_pos == up_len {
+            if packet.is_none() && upload_fin && up_pos == up_len {
                 match http.send_body(&mut conn, upload, &[], true) {
                     Ok(_) => {
                         upload_fin = false;
                     }
                     Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {}
                     Err(e) => return Err(quic_io(e)),
+                }
+            }
+            if let Some(packet) = &mut packet {
+                if !packet.active
+                    && !packet.buffer.is_empty()
+                    && (app_eof
+                        || packet.buffer.len() >= packet.max
+                        || packet
+                            .deadline
+                            .is_some_and(|d| tokio::time::Instant::now() >= d))
+                {
+                    let (request, body) = xhttp::build_packet_request(
+                        &packet.config,
+                        &packet.authority,
+                        &packet.session,
+                        packet.sequence,
+                        &packet.buffer,
+                    )
+                    .map_err(quic_io)?;
+                    let request_headers = headers(&request).map_err(quic_io)?;
+                    match http.send_request(&mut conn, &request_headers, body.is_empty()) {
+                        Ok(id) => {
+                            upload = id;
+                            got_upload_headers = false;
+                            packet.active = true;
+                            packet.ack_deadline =
+                                Some(tokio::time::Instant::now() + HEADER_TIMEOUT);
+                            packet.body = body;
+                            packet.fin_sent = packet.body.is_empty();
+                            packet.ack_received = false;
+                            packet.buffer.clear();
+                            packet.deadline = None;
+                            packet.sequence = packet
+                                .sequence
+                                .checked_add(1)
+                                .ok_or_else(|| quic_io("packet sequence exhausted"))?;
+                        }
+                        Err(quiche::h3::Error::StreamBlocked) | Err(quiche::h3::Error::Done) => {
+                            packet.request_blocked = true;
+                        }
+                        Err(e) => return Err(quic_io(e)),
+                    }
+                }
+                if packet.active && !packet.fin_sent {
+                    if !packet.body.is_empty() {
+                        match http.send_body(&mut conn, upload, &packet.body, false) {
+                            Ok(n) => {
+                                let _ = packet.body.split_to(n);
+                            }
+                            Err(quiche::h3::Error::StreamBlocked)
+                            | Err(quiche::h3::Error::Done) => {}
+                            Err(e) => return Err(quic_io(e)),
+                        }
+                    }
+                    if packet.body.is_empty() {
+                        match http.send_body(&mut conn, upload, &[], true) {
+                            Ok(_) => packet.fin_sent = true,
+                            Err(quiche::h3::Error::StreamBlocked)
+                            | Err(quiche::h3::Error::Done) => {}
+                            Err(e) => return Err(quic_io(e)),
+                        }
+                    }
+                }
+                if packet.active && packet.fin_sent && packet.ack_received {
+                    packet.active = false;
+                    packet.ack_deadline = None;
+                }
+                if app_eof && !packet.active && packet.buffer.is_empty() {
+                    if let Some(tx) = finished.take() {
+                        let _ = tx.send(());
+                    }
                 }
             }
             if down_readable && down_pos == down_len {
@@ -330,7 +445,13 @@ async fn drive(
                 }
             }
         }
-        if download_fin && down_pos == down_len && !down_readable {
+        if download_fin
+            && down_pos == down_len
+            && !down_readable
+            && packet
+                .as_ref()
+                .is_none_or(|p| app_eof && !p.active && p.buffer.is_empty())
+        {
             if !got_download_headers {
                 return Err(quic_io("download ended without response headers"));
             }
@@ -359,19 +480,48 @@ async fn drive(
             .map_or(Duration::from_secs(86400), |d| {
                 d.saturating_duration_since(tokio::time::Instant::now())
             });
+        let flush_wait = packet
+            .as_ref()
+            .filter(|p| !p.active && !p.request_blocked)
+            .and_then(|p| p.deadline)
+            .map(|d| d.saturating_duration_since(tokio::time::Instant::now()));
+        let ack_wait = packet
+            .as_ref()
+            .and_then(|p| p.ack_deadline)
+            .map(|d| d.saturating_duration_since(tokio::time::Instant::now()));
+        let read_limit = packet
+            .as_ref()
+            .map_or(CHUNK, |p| CHUNK.min(p.max - p.buffer.len()));
         tokio::select! {
             n = socket.recv(&mut incoming) => {
                 let n = n?;
+                if let Some(packet) = &mut packet { packet.request_blocked = false; }
                 if n > incoming.len() { return Err(quic_io("oversized datagram")); }
                 match conn.recv(&mut incoming[..n], quiche::RecvInfo { from: peer, to: local }) {
                     Ok(_) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidPacket) => {},
                     Err(e) => return Err(quic_io(e)),
                 }
             }
-            n = app_read.read(&mut up), if h3.is_some() && up_pos == up_len && !app_eof => {
-                let n = n?; up_pos = 0; up_len = n;
-                if n == 0 { upload_fin = true; app_eof = true; }
+            n = app_read.read(&mut up[..read_limit]), if h3.is_some() && (packet.is_some() || up_pos == up_len) && !app_eof && read_limit > 0 => {
+                let n = n?;
+                if let Some(packet) = &mut packet {
+                    if n == 0 { app_eof = true; }
+                    else {
+                        if packet.buffer.is_empty() {
+                            use rand::Rng as _;
+                            let delay = rand::rng().random_range(packet.config.sc_min_posts_interval_ms.0..=packet.config.sc_min_posts_interval_ms.1);
+                            packet.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(delay as u64));
+                        }
+                        packet.buffer.reserve_exact(n);
+                        packet.buffer.extend_from_slice(&up[..n]);
+                    }
+                } else {
+                    up_pos = 0; up_len = n;
+                    if n == 0 { upload_fin = true; app_eof = true; }
+                }
             }
+            _ = tokio::time::sleep(flush_wait.unwrap_or(Duration::from_secs(86400))), if flush_wait.is_some() => {},
+            _ = tokio::time::sleep(ack_wait.unwrap_or(Duration::from_secs(86400))), if ack_wait.is_some() => return Err(quic_io("packet acknowledgement timed out")),
             n = app_write.write(&down[down_pos..down_len]), if down_pos < down_len => {
                 down_pos += n?;
             }
@@ -387,10 +537,54 @@ async fn drive(
     }
 }
 
+struct PacketUpload {
+    config: XhttpConfig,
+    authority: String,
+    session: String,
+    max: usize,
+    buffer: Vec<u8>,
+    body: bytes::Bytes,
+    sequence: u64,
+    active: bool,
+    fin_sent: bool,
+    ack_received: bool,
+    request_blocked: bool,
+    deadline: Option<tokio::time::Instant>,
+    ack_deadline: Option<tokio::time::Instant>,
+}
+impl PacketUpload {
+    fn new(config: XhttpConfig, authority: String, session: String) -> Self {
+        use rand::Rng as _;
+        let max = rand::rng()
+            .random_range(config.sc_max_each_post_bytes.0..=config.sc_max_each_post_bytes.1);
+        let max = if matches!(config.uplink_data_placement.as_str(), "header" | "cookie") {
+            max.min(8 * 1024)
+        } else {
+            max
+        };
+        Self {
+            config,
+            authority,
+            session,
+            max,
+            buffer: Vec::new(),
+            body: bytes::Bytes::new(),
+            sequence: 0,
+            active: false,
+            fin_sent: false,
+            ack_received: false,
+            request_blocked: false,
+            deadline: None,
+            ack_deadline: None,
+        }
+    }
+}
+
 struct H3Stream {
     inner: tokio::io::DuplexStream,
     error: Arc<Mutex<Option<io::Error>>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    finished: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 impl H3Stream {
     fn check(&self) -> io::Result<()> {
@@ -439,7 +633,20 @@ impl AsyncWrite for H3Stream {
         if let Err(e) = self.check() {
             return Poll::Ready(Err(e));
         }
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        std::task::ready!(Pin::new(&mut self.inner).poll_shutdown(cx))?;
+        let Some(finished) = &mut self.finished else {
+            return Poll::Ready(Ok(()));
+        };
+        use std::future::Future as _;
+        let result = std::task::ready!(Pin::new(finished).poll(cx));
+        self.finished = None;
+        self.check()?;
+        Poll::Ready(result.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "XHTTP/3 packet upload worker closed",
+            )
+        }))
     }
 }
 impl Drop for H3Stream {

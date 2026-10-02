@@ -1653,21 +1653,24 @@ async fn parse_vless_xhttp_invalid_split_options_skipped() {
         "session-length: '24-16'",
         "session-length: '16-1000000000'",
         "session-table: Base62\n      session-length: '1-2'",
-        "session-placement: cookie",
-        "session-table: unsupported",
+        "session-placement: unknown",
+        "session-table: 'ééééééééé'",
         "session-placement: header\n      session-key: 'has space'",
         "x-padding-obfs-mode: 'true'",
         "x-padding-obfs-mode: true\n      x-padding-method: unknown",
         "x-padding-obfs-mode: true\n      x-padding-placement: header",
         "x-padding-obfs-mode: true\n      x-padding-placement: cookie",
-        "x-padding-obfs-mode: true\n      x-padding-placement: header\n      x-padding-header: X-Session\n      session-placement: header",
         "download-settings: {}",
-        "uplink-chunk-size: '1024'",
         "mode: 123",
     ] {
         let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    xhttp-opts:\n      {option}\n");
-        let config = load_config_from_str(&yaml).await.expect("warn-and-skip load");
-        assert!(!config.proxies.contains_key("invalid"), "invalid option accepted: {option}");
+        let config = load_config_from_str(&yaml)
+            .await
+            .expect("warn-and-skip load");
+        assert!(
+            !config.proxies.contains_key("invalid"),
+            "invalid option accepted: {option}"
+        );
     }
 }
 
@@ -1691,7 +1694,7 @@ proxies:
     tls: true
     network: xhttp
     xhttp-opts:
-      mode: auto
+      mode: invalid
 "#;
     let config = load_config_from_str(yaml)
         .await
@@ -1754,6 +1757,21 @@ async fn parse_vless_xhttp_h3_rejects_plaintext_and_mixed_alpn() {
         let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: {tls}\n    alpn: {alpn}\n    network: xhttp\n");
         let config = load_config_from_str(&yaml).await.unwrap();
         assert!(!config.proxies.contains_key("invalid"));
+    }
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_rejects_unsupported_http1_alpn() {
+    for (alpn, accepted) in [
+        ("[]", true),
+        ("[h2]", true),
+        ("[http/1.1]", false),
+        ("[h2, http/1.1]", false),
+        ("[custom]", false),
+    ] {
+        let yaml = format!("proxies:\n  - name: test\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    alpn: {alpn}\n    network: xhttp\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(config.proxies.contains_key("test"), accepted, "{alpn}");
     }
 }
 

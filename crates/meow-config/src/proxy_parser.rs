@@ -1495,6 +1495,12 @@ fn parse_vless(
                 .into(),
         );
     }
+    if network == "xhttp" && !use_h3 && alpn.iter().any(|p| p != "h2") {
+        return Err(
+            "vless: XHTTP currently requires alpn: [h2] or [h3]; HTTP/1.1 and mixed ALPN are not implemented"
+                .into(),
+        );
+    }
     let mut h3_client = None;
 
     // ── Reality opts ──────────────────────────────────────────────────────
@@ -2129,11 +2135,7 @@ fn parse_vless_xhttp_config(
                 .ok_or_else(|| format!("vless: xhttp-opts.{key} must be a boolean")),
         }
     };
-    let path = xhttp_opts
-        .and_then(|o| o.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
+    let path = string_option("path", "/")?;
     let fallback_host = if servername.is_empty() {
         server
     } else {
@@ -2161,93 +2163,78 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    let mode = string_option("mode", "stream-one")?;
-    if !mode.eq_ignore_ascii_case("stream-one") && !mode.eq_ignore_ascii_case("stream-up") {
-        return Err(format!(
-            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' and 'stream-up' are implemented"
-        ));
-    }
-    let extra_headers: Vec<(String, String)> = match xhttp_opts
-        .and_then(|o| o.get("headers"))
-        .and_then(|h| h.as_mapping())
-    {
-        Some(m) => {
-            // Bound remotely-supplied header lists — the padding cap below
-            // covers the worst case, but a giant `headers` map is still
-            // attacker-chosen process memory (issue #648).
-            if m.len() > MAX_EXTRA_HEADERS {
-                return Err(format!(
-                    "vless: xhttp-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
-                    m.len()
-                ));
-            }
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str()?.to_string();
-                    let val = v.as_str()?.to_string();
-                    Some((key, val))
-                })
-                .collect()
-        }
+    let mode = string_option("mode", "auto")?;
+    let extra_headers = match xhttp_opts.and_then(|opts| opts.get("headers")) {
         None => Vec::new(),
-    };
-    let no_grpc_header = bool_option("no-grpc-header", false)?;
-    let x_padding_bytes =
-        if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
-            if let Some(s) = padding_val.as_str() {
-                let parts: Vec<&str> = s.split('-').collect();
-                if parts.len() != 2 {
-                    return Err(format!(
-                        "vless: invalid x-padding-bytes range '{s}', expected 'min-max'"
-                    ));
-                }
-                let min = parts[0]
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("vless: invalid min in x-padding-bytes '{s}': {e}"))?;
-                let max = parts[1]
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("vless: invalid max in x-padding-bytes '{s}': {e}"))?;
-                if min > max {
-                    return Err(format!(
-                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                    ));
-                }
-                Some((min, max))
-            } else if let Some(seq) = padding_val.as_sequence() {
-                if seq.len() != 2 {
-                    return Err("vless: x-padding-bytes array must have 2 elements".into());
-                }
-                // `try_from`, not `as usize` — on 32-bit targets a u64 that
-                // exceeds usize::MAX would wrap under the cap check.
-                let min = usize::try_from(
-                    seq[0]
-                        .as_u64()
-                        .ok_or_else(|| "vless: invalid min in x-padding-bytes".to_string())?,
-                )
-                .map_err(|_| "vless: x-padding-bytes min out of range".to_string())?;
-                let max = usize::try_from(
-                    seq[1]
-                        .as_u64()
-                        .ok_or_else(|| "vless: invalid max in x-padding-bytes".to_string())?,
-                )
-                .map_err(|_| "vless: x-padding-bytes max out of range".to_string())?;
-                if min > max {
-                    return Err(format!(
-                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                    ));
-                }
-                Some((min, max))
-            } else {
-                return Err(
-                    "vless: x-padding-bytes must be a 'min-max' string or 2-element integer array"
-                        .to_string(),
-                );
+        Some(value) => {
+            let mapping = value
+                .as_mapping()
+                .ok_or("vless: xhttp-opts.headers must be a mapping")?;
+            if mapping.len() > MAX_EXTRA_HEADERS {
+                return Err("vless: too many XHTTP headers".into());
             }
-        } else {
-            Some((100, 1000))
+            mapping
+                .iter()
+                .map(|(key, value)| {
+                    let key = key
+                        .as_str()
+                        .ok_or("vless: XHTTP header names must be strings")?;
+                    let value = value
+                        .as_str()
+                        .ok_or("vless: XHTTP header values must be strings")?;
+                    Ok((key.to_string(), value.to_string()))
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?
+        }
+    };
+    let range_option =
+        |key: &str, default: (usize, usize)| -> std::result::Result<(usize, usize), String> {
+            let value = xhttp_opts.and_then(|opts| opts.get(key));
+            let Some(value) = value else {
+                return Ok(default);
+            };
+            if let Some(text) = value.as_str() {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Ok(default);
+                }
+                let (min, max) = text.split_once('-').unwrap_or((text, text));
+                let min = min
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("vless: invalid {key} min"))?;
+                let max = max
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("vless: invalid {key} max"))?;
+                if min > max {
+                    return Err(format!("vless: {key} min exceeds max"));
+                }
+                return Ok((min, max));
+            }
+            if let Some(array) = value.as_sequence() {
+                if array.len() != 2 {
+                    return Err(format!("vless: {key} array must have 2 elements"));
+                }
+                let integer = |value: &serde_yaml::Value| {
+                    value
+                        .as_u64()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .ok_or_else(|| format!("vless: invalid {key} integer"))
+                };
+                let min = integer(&array[0])?;
+                let max = integer(&array[1])?;
+                if min > max {
+                    return Err(format!("vless: {key} min exceeds max"));
+                }
+                return Ok((min, max));
+            }
+            Err(format!(
+                "vless: {key} must be a range string or 2-element integer array"
+            ))
         };
+    let no_grpc_header = bool_option("no-grpc-header", false)?;
+    let x_padding_bytes = Some(range_option("x-padding-bytes", (100, 1000))?);
     // The padding becomes a `String` of `pad_len` bytes on every connect —
     // unbounded, a provider/subscription node could abort the process via a
     // remote health check or any routed dial (issue #648).
@@ -2259,31 +2246,10 @@ fn parse_vless_xhttp_config(
         }
     }
 
-    let length = string_option("session-length", "16-32")?;
-    let (min, max) = length.split_once('-').unwrap_or((&length, &length));
-    let session_length = (
-        min.trim()
-            .parse::<usize>()
-            .map_err(|_| "vless: invalid session-length min".to_string())?,
-        max.trim()
-            .parse::<usize>()
-            .map_err(|_| "vless: invalid session-length max".to_string())?,
-    );
+    let session_length = range_option("session-length", (16, 32))?;
     // These alter the wire format / destination. Until implemented, fail
     // closed rather than load a node that dials using different semantics.
-    for key in [
-        "download-settings",
-        "download-config",
-        "uplink-http-method",
-        "uplink-data-placement",
-        "uplink-data-key",
-        "uplink-chunk-size",
-        "seq-placement",
-        "seq-key",
-        "sc-max-each-post-bytes",
-        "sc-min-posts-interval-ms",
-        "reuse-settings",
-    ] {
+    for key in ["download-settings", "download-config", "reuse-settings"] {
         if xhttp_opts.is_some_and(|opts| opts.get(key).is_some()) {
             return Err(format!("vless: xhttp-opts.{key} is not implemented"));
         }
@@ -2294,6 +2260,22 @@ fn parse_vless_xhttp_config(
         scheme: if tls { "https" } else { "http" }.to_string(),
         extra_headers,
         mode,
+        has_reality: config.get("reality-opts").is_some(),
+        uplink_http_method: {
+            let method = string_option("uplink-http-method", "POST")?;
+            if method.is_empty() {
+                "POST".into()
+            } else {
+                method
+            }
+        },
+        seq_placement: string_option("seq-placement", "path")?,
+        seq_key: string_option("seq-key", "")?,
+        uplink_data_placement: string_option("uplink-data-placement", "body")?,
+        uplink_data_key: string_option("uplink-data-key", "")?,
+        uplink_chunk_size: range_option("uplink-chunk-size", (0, 0))?,
+        sc_max_each_post_bytes: range_option("sc-max-each-post-bytes", (1_000_000, 1_000_000))?,
+        sc_min_posts_interval_ms: range_option("sc-min-posts-interval-ms", (30, 30))?,
         no_grpc_header,
         x_padding_bytes,
         x_padding_obfs_mode: bool_option("x-padding-obfs-mode", false)?,

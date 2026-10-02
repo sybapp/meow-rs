@@ -67,6 +67,8 @@ xhttp = [
     "dep:h2",
     "dep:http",
     "dep:rand",
+    "dep:base64",
+    "dep:form_urlencoded",
 ]
 # HTTP/3 XHTTP over QUIC, sharing the workspace BoringSSL.
 xhttp3 = ["xhttp", "tls", "dep:quiche"]
@@ -147,6 +149,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util      = { workspace = true, optional = true }
 base64            = { workspace = true, optional = true }
+form_urlencoded   = { version = "1", optional = true }
 
 # grpc + h2 features (share the h2 crate; see ADR-0001 §5 note on intentional dep sharing)
 h2   = { version = "0.4", optional = true }
@@ -209,6 +212,7 @@ foreign-types      = { workspace = true, optional = true }
 webpki-root-certs  = { version = "1", optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 # `test-util` enables paused-time tests (start_paused / time::advance) —
 # not part of tokio's `full` set.
 tokio        = { workspace = true, features = ["test-util"] }
@@ -268,4 +272,8 @@ workspace = true
 
 [[test]]
 name = "xhttp3_test"
+required-features = ["xhttp3"]
+
+[[test]]
+name = "xhttp_mihomo_interop"
 required-features = ["xhttp3"]
