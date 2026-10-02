@@ -1,11 +1,14 @@
 # XHTTP compatibility
 
-VLESS `network: xhttp` supports `stream-one` and `stream-up` over HTTP/2,
+VLESS `network: xhttp` supports `stream-one` and `stream-up` over HTTP/2 and HTTP/3,
 including TLS with `alpn: [h2]` and plain h2c. Enable the `xhttp` transport
-feature when embedding `meow-transport`; the config crate already enables it.
+feature for HTTP/2 or `xhttp3` for QUIC when embedding `meow-transport`.
+The VLESS feature enables both in the config/proxy crates. For the example below,
+changing `alpn: [h2]` to `alpn: [h3]` selects a real QUIC/UDP connection.
+Mixed ALPN lists and draft `h3-*` identifiers are rejected.
 
 `stream-up` sends a GET download request first, then a POST upload request
-on the same HTTP/2 connection. Both carry the same fresh session ID. Connect
+on the same HTTP/2 or QUIC connection. Both carry the same fresh session ID. Connect
 does not wait for response headers: some servers and CDNs send them only
 after the first upload byte. The download requires HTTP 200, while the
 upload acknowledgement and `stream-one` accept any successful status.
@@ -65,11 +68,27 @@ pending payload. Upload acknowledgement bodies are drained without retaining
 their data. Drop half-closes the upload and drains both response streams with
 the existing one-second driver grace period, including peers that never reply.
 No extra per-connection acknowledgement task is spawned during normal I/O.
-These bounds do not constitute an iOS memory benchmark or an iOS app build.
+HTTP/3 owns one QUIC driver and an eight-packet receive bridge for proxied UDP
+associations. The bridge preserves `read_packet` futures across cancellation;
+UDP socket protection, `dialer-proxy` and internal-probe metadata remain in
+`meow-proxy`. It uses bounded 64 KiB duplex halves, 16 KiB body chunks, a 512 KiB
+connection receive window, 256 KiB stream windows (autotuning capped at those
+values), two bidirectional streams and three peer unidirectional streams.
+These are buffer/window bounds, not a measured total RSS limit. Congestion
+control also governs QUIC's outstanding send data. Cancelled or timed-out
+handshakes abort their driver; a dropped established stream has a one-second
+cleanup grace. A 15-second QUIC keepalive preserves quiet live connections
+under the 30-second idle timeout. HTTP/3 checks both certificate trust and the server name, with
+the same Mozilla roots and fingerprint profiles as TCP TLS. It rejects
+unsupported REALITY/ECH/mTLS/pin options rather than silently ignoring them.
+
+These bounds do not constitute an iOS memory benchmark. See
+[iOS core builds](ios-core.md) for the Apple-target build workflow and the
+remaining app/device validation.
 
 ## Limitations and deliberate divergences
 
-HTTP/3 (`alpn: [h3]`), `auto`, `packet-up`, separate download settings,
+`auto`, `packet-up`, separate download settings,
 connection reuse settings, custom upload methods, cookie/query sessions,
 cookie/query padding and other session alphabets are not implemented. Explicit
 unsupported options are rejected instead of silently selecting another wire
@@ -98,6 +117,7 @@ Hermetic regression tests:
 
 ```sh
 cargo test -p meow-transport --no-default-features --features xhttp,ws --lib --test xhttp_test
+cargo test -p meow-transport --no-default-features --features reality,xhttp3 --lib --test xhttp3_test
 cargo test -p meow-config --test vless_config_test
 ```
 

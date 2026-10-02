@@ -1488,6 +1488,15 @@ fn parse_vless(
         .unwrap_or("tcp");
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
+    let use_h3 = network == "xhttp" && alpn.iter().any(|p| p == "h3" || p.starts_with("h3-"));
+    if use_h3 && (!tls || alpn.iter().any(|p| p != "h3")) {
+        return Err(
+            "vless: XHTTP/3 requires tls: true and alpn: [h3] (draft/mixed ALPN unsupported)"
+                .into(),
+        );
+    }
+    let mut h3_client = None;
+
     // ── Reality opts ──────────────────────────────────────────────────────
     let reality = parse_vless_reality_opts(name, config)?;
     if reality.is_some() {
@@ -1659,9 +1668,17 @@ fn parse_vless(
             }
         }
 
-        let tls_layer =
-            TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
-        chain.push(Box::new(tls_layer));
+        if use_h3 {
+            let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+            h3_client = Some(
+                meow_transport::xhttp3::Xhttp3Client::new(xhttp_cfg, &tls_cfg)
+                    .map_err(|e| format!("vless: HTTP/3 layer error: {e}"))?,
+            );
+        } else {
+            let tls_layer =
+                TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
+            chain.push(Box::new(tls_layer));
+        }
     }
 
     match network {
@@ -1804,20 +1821,10 @@ fn parse_vless(
             chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
         }
         "xhttp" => {
-            if config
-                .get("alpn")
-                .and_then(serde_yaml::Value::as_sequence)
-                .is_some_and(|protocols| {
-                    protocols
-                        .iter()
-                        .filter_map(serde_yaml::Value::as_str)
-                        .any(|protocol| protocol == "h3" || protocol.starts_with("h3-"))
-                })
-            {
-                return Err("vless: XHTTP over HTTP/3 is not implemented; use alpn: [h2]".into());
+            if !use_h3 {
+                let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+                chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
             }
-            let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
-            chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
         }
         other => {
             return Err(format!(
@@ -1837,6 +1844,11 @@ fn parse_vless(
         chain,
         Arc::clone(dialer),
     );
+    if let Some(client) = h3_client {
+        adapter = adapter
+            .with_xhttp3(client)
+            .map_err(|e| format!("vless: {e}"))?;
+    }
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
@@ -2453,10 +2465,12 @@ fn parse_vless_reality_opts(
     let mut short_id = [0u8; 8];
     short_id[..short_id_vec.len()].copy_from_slice(&short_id_vec);
 
-    let support_x25519_mlkem768 = opts
-        .get("support-x25519mlkem768")
-        .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false);
+    let support_x25519_mlkem768 = match opts.get("support-x25519mlkem768") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            "vless: reality-opts.support-x25519mlkem768 must be a boolean".to_string()
+        })?,
+    };
 
     Ok(Some(meow_transport::tls::RealityConfig {
         public_key,

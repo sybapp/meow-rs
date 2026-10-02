@@ -821,21 +821,19 @@ impl<Output> Kcp<Output> {
             if self.probe_wait == 0 {
                 self.probe_wait = KCP_PROBE_INIT;
                 self.ts_probe = self.current.wrapping_add(self.probe_wait);
-            } else {
-                if timediff(self.current, self.ts_probe) >= 0 {
-                    if self.probe_wait < KCP_PROBE_INIT {
-                        self.probe_wait = KCP_PROBE_INIT;
-                    }
-
-                    self.probe_wait = self.probe_wait.wrapping_add(self.probe_wait / 2);
-
-                    if self.probe_wait > KCP_PROBE_LIMIT {
-                        self.probe_wait = KCP_PROBE_LIMIT;
-                    }
-
-                    self.ts_probe = self.current.wrapping_add(self.probe_wait);
-                    self.probe |= KCP_ASK_SEND;
+            } else if timediff(self.current, self.ts_probe) >= 0 {
+                if self.probe_wait < KCP_PROBE_INIT {
+                    self.probe_wait = KCP_PROBE_INIT;
                 }
+
+                self.probe_wait = self.probe_wait.wrapping_add(self.probe_wait / 2);
+
+                if self.probe_wait > KCP_PROBE_LIMIT {
+                    self.probe_wait = KCP_PROBE_LIMIT;
+                }
+
+                self.ts_probe = self.current.wrapping_add(self.probe_wait);
+                self.probe |= KCP_ASK_SEND;
             }
         } else {
             self.ts_probe = 0;

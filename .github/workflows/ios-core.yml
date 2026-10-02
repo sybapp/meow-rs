@@ -1,0 +1,34 @@
+name: iOS core
+on:
+  push:
+    branches: [main, feat/xhttp-stream-up]
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/ios-core.yml']
+  pull_request:
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/ios-core.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-core-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-ios, aarch64-apple-ios-sim]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install targets on the repository toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup target add --toolchain "$channel" ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-${{ matrix.target }}
+      - name: Compile VLESS, Vision, REALITY and XHTTP H2/H3 core
+        run: cargo build --locked --target ${{ matrix.target }} -p meow-config --no-default-features --features vless-vision
+      - name: Compile routing and listener libraries
+        run: cargo build --locked --target ${{ matrix.target }} -p meow-tunnel -p meow-listener --no-default-features

@@ -59,6 +59,9 @@ pub mod httpupgrade;
 #[cfg(feature = "xhttp")]
 pub mod xhttp;
 
+#[cfg(feature = "xhttp3")]
+pub mod xhttp3;
+
 /// Shared TLS-record assembly / outbox machinery for the record-framed
 /// SIP003 transports (`shadow_tls`, `restls`, `jls`).
 #[cfg(any(feature = "shadow-tls", feature = "restls", feature = "jls"))]

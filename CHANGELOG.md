@@ -9,6 +9,12 @@ the canonical, in-repo source a release is cut from.
 ## [Unreleased]
 
 ### Added
+- VLESS XHTTP HTTP/3 over QUIC with protected/proxied UDP dialing, bounded receive
+  windows and cancellation cleanup; standard `alpn: [h3]` selects the new path.
+- REALITY `support-x25519mlkem768` now performs the hybrid TLS key exchange with
+  classical fallback, authenticated Finished and application-data regression tests.
+- Apple-device and simulator core-library build workflow; this does not provide
+  an iOS app or signed NetworkExtension.
 
 - **XHTTP `stream-up` over HTTP/2** — VLESS can upload with POST and
   download with GET using one shared session ID. Supports path or header
@@ -17,7 +23,7 @@ the canonical, in-repo source a release is cut from.
   or `queryInHeader`. Response headers stay deferred so CDN buffering
   cannot deadlock the first payload write; both response streams drain
   within the existing bounded connection-driver cleanup window.
-  HTTP/3 and unsupported session/padding placements fail explicitly.
+  Unsupported session/padding placements fail explicitly.
   See [XHTTP compatibility](docs/xhttp.md) for the supported options.
 
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
@@ -447,6 +453,8 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
+
+- Clear inherited obfs/KCP/subscription Clippy warnings without behavior changes.
 
 - **`meow -t` and startup now reject inbounds the binary did not
   compile.** A `listeners:` entry such as `type: shadowsocks` without

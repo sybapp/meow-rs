@@ -272,7 +272,7 @@ fn random_token(table: &[u8], length: usize) -> String {
         .collect()
 }
 
-fn generate_session(config: &XhttpConfig) -> String {
+pub(crate) fn generate_session(config: &XhttpConfig) -> String {
     if config.session_table.is_empty() {
         random_token(b"0123456789abcdef", 32)
     } else {
@@ -323,7 +323,7 @@ fn generate_padding(method: &str, length: usize) -> String {
     padding
 }
 
-fn build_request(
+pub(crate) fn build_request(
     config: &XhttpConfig,
     authority: &str,
     method: http::Method,
@@ -557,7 +557,7 @@ fn validate_scheme(scheme: &str) -> Result<()> {
     }
 }
 
-fn format_authority(host: &str) -> String {
+pub(crate) fn format_authority(host: &str) -> String {
     if host.starts_with('[') || !host.contains(':') {
         host.to_string()
     } else if host.parse::<std::net::Ipv6Addr>().is_ok() {

@@ -986,3 +986,54 @@ mod connect_over_tests {
         assert_eq!(&buf, payload, "relay echo mismatch");
     }
 }
+
+#[cfg(feature = "hysteria2")]
+#[path = "../../meow-transport/tests/support/xhttp3_peer.rs"]
+mod xhttp3_peer;
+
+#[cfg(feature = "hysteria2")]
+#[tokio::test]
+async fn vless_over_xhttp3_stream_up_roundtrip() {
+    use meow_common::{Metadata, Network, ProxyAdapter};
+    use meow_proxy::{TransportChain, VlessAdapter};
+    use meow_transport::{tls::TlsConfig, xhttp::XhttpConfig, xhttp3::Xhttp3Client};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let peer = xhttp3_peer::peer("127.0.0.1:0", true, 200, 204, true, true).await;
+    let mut tls = TlsConfig::new("example.org");
+    tls.additional_roots.push(peer.root.clone());
+    let cfg = XhttpConfig {
+        mode: "stream-up".into(),
+        hosts: vec!["example.org".into()],
+        ..Default::default()
+    };
+    let client = Xhttp3Client::new(cfg, &tls).unwrap();
+    let adapter = VlessAdapter::new(
+        "h3",
+        "127.0.0.1",
+        peer.addr.port(),
+        vless_tests::TEST_UUID,
+        None,
+        false,
+        TransportChain::empty(),
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+    )
+    .with_xhttp3(client)
+    .unwrap();
+    let meta = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some("127.0.0.1".parse().unwrap()),
+        dst_port: 80,
+        ..Default::default()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut conn = adapter.dial_tcp(&meta).await.unwrap();
+        conn.write_all(b"VLESS over QUIC").await.unwrap();
+        conn.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        conn.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"VLESS over QUIC");
+        peer.task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}

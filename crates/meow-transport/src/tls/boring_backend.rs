@@ -47,6 +47,49 @@ struct FingerprintParams {
     sigalgs_list: &'static str,
 }
 
+/// Apply the same fingerprint/groups to TCP TLS and QUIC TLS.
+pub(super) fn apply_fingerprint(
+    b: &mut boring::ssl::SslContextBuilder,
+    config: &TlsConfig,
+) -> Result<()> {
+    // ── Fingerprint shaping ──────────────────────────────────────────────
+    if let Some(fp_str) = &config.fingerprint {
+        if let Some(p) = resolve_fingerprint(fp_str) {
+            b.set_cipher_list(p.cipher_list)
+                .map_err(|e| TransportError::Config(format!("boring: set_cipher_list: {e}")))?;
+            b.set_curves_list(p.curves_list)
+                .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
+            b.set_grease_enabled(p.grease);
+            b.set_permute_extensions(p.permute_extensions);
+            b.set_sigalgs_list(p.sigalgs_list)
+                .map_err(|e| TransportError::Config(format!("boring: set_sigalgs_list: {e}")))?;
+        } else {
+            // Deferred profile — warn and continue with boring defaults.
+            warn!(
+                "client-fingerprint=\"{}\" is not yet supported; \
+                     using BoringSSL defaults. \
+                     See docs/specs/ech-utls-design.md §10 for the deferred list.",
+                fp_str
+            );
+        }
+    }
+
+    // ── supported_groups override ────────────────────────────────────────
+    // An explicit `curves` list applies after — and therefore overrides —
+    // a resolved fingerprint profile's own list.  shadow-tls v2 uses it
+    // only when no profile resolved (its pin would otherwise clobber
+    // firefox/android's distinct group lists); upstream's
+    // `BuildRemovedX25519MLKEM768HandshakeState` removes the hybrid-PQ
+    // group surgically post-uTLS, which our whole-list override can only
+    // express as a fallback for the unshaped default hello.
+    if let Some(curves) = &config.curves {
+        b.set_curves_list(curves)
+            .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
+    }
+
+    Ok(())
+}
+
 // ── Profile constants (derived from metacubex/utls u_parrots.go) ─────────────
 //
 // TLS 1.2 cipher strings only — BoringSSL always prepends the three TLS 1.3
@@ -519,41 +562,7 @@ impl BoringInner {
         let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
             .map_err(|e| TransportError::Config(format!("boring TLS init: {e}")))?;
 
-        // ── Fingerprint shaping ──────────────────────────────────────────────
-        if let Some(fp_str) = &config.fingerprint {
-            if let Some(p) = resolve_fingerprint(fp_str) {
-                b.set_cipher_list(p.cipher_list)
-                    .map_err(|e| TransportError::Config(format!("boring: set_cipher_list: {e}")))?;
-                b.set_curves_list(p.curves_list)
-                    .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
-                b.set_grease_enabled(p.grease);
-                b.set_permute_extensions(p.permute_extensions);
-                b.set_sigalgs_list(p.sigalgs_list).map_err(|e| {
-                    TransportError::Config(format!("boring: set_sigalgs_list: {e}"))
-                })?;
-            } else {
-                // Deferred profile — warn and continue with boring defaults.
-                warn!(
-                    "client-fingerprint=\"{}\" is not yet supported; \
-                     using BoringSSL defaults. \
-                     See docs/specs/ech-utls-design.md §10 for the deferred list.",
-                    fp_str
-                );
-            }
-        }
-
-        // ── supported_groups override ────────────────────────────────────────
-        // An explicit `curves` list applies after — and therefore overrides —
-        // a resolved fingerprint profile's own list.  shadow-tls v2 uses it
-        // only when no profile resolved (its pin would otherwise clobber
-        // firefox/android's distinct group lists); upstream's
-        // `BuildRemovedX25519MLKEM768HandshakeState` removes the hybrid-PQ
-        // group surgically post-uTLS, which our whole-list override can only
-        // express as a fallback for the unshaped default hello.
-        if let Some(curves) = &config.curves {
-            b.set_curves_list(curves)
-                .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
-        }
+        apply_fingerprint(&mut b, config)?;
 
         // ── ALPN ────────────────────────────────────────────────────────────
         if !config.alpn.is_empty() {

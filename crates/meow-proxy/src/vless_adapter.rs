@@ -67,6 +67,7 @@ pub struct VlessAdapter {
     #[cfg(feature = "vless-encryption")]
     encryption: Option<Arc<ClientInstance>>,
     health: ProxyHealth,
+    uses_udp_transport: bool,
 }
 
 impl VlessAdapter {
@@ -104,7 +105,30 @@ impl VlessAdapter {
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
+            uses_udp_transport: false,
         }
+    }
+
+    /// Use a QUIC-backed HTTP/3 dialer instead of the TCP transport chain.
+    /// Configure before enabling mux so shared sessions capture this dialer.
+    pub fn with_xhttp3(mut self, client: meow_transport::xhttp3::Xhttp3Client) -> Result<Self> {
+        if !self.transport.is_empty() || self.flow.is_some() {
+            return Err(MeowError::Config(
+                "XHTTP/3 requires an empty TCP transport chain and no Vision flow".into(),
+            ));
+        }
+        #[cfg(feature = "mux")]
+        if self.mux.is_some() {
+            return Err(MeowError::Config(
+                "configure XHTTP/3 before enabling mux".into(),
+            ));
+        }
+        self.dialer = Arc::new(crate::xhttp3_dialer::Xhttp3Dialer {
+            client,
+            dialer: Arc::clone(&self.dialer),
+        });
+        self.uses_udp_transport = true;
+        Ok(self)
     }
 
     /// Enable connection multiplexing.  Two wire protocols share one
@@ -369,6 +393,11 @@ impl ProxyAdapter for VlessAdapter {
         stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
+        if self.uses_udp_transport {
+            return Err(MeowError::NotSupported(
+                "XHTTP/3 needs a UDP association; TCP relay streams cannot carry QUIC".into(),
+            ));
+        }
         #[cfg(feature = "mux")]
         if self.mux.is_some() {
             debug!("VLESS mux bypassed on relay-supplied stream (single-use)");

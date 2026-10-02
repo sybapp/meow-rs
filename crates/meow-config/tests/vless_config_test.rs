@@ -1672,12 +1672,12 @@ async fn parse_vless_xhttp_invalid_split_options_skipped() {
 }
 
 #[tokio::test]
-async fn parse_vless_xhttp_h3_is_explicitly_unsupported() {
+async fn parse_vless_xhttp_h3_loads() {
     let yaml = "proxies:\n  - name: h3\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    alpn: [h3]\n    network: xhttp\n    xhttp-opts:\n      mode: stream-up\n";
     let config = load_config_from_str(yaml)
         .await
         .expect("warn-and-skip load");
-    assert!(!config.proxies.contains_key("h3"));
+    assert!(config.proxies.contains_key("h3"));
 }
 #[tokio::test]
 async fn parse_vless_xhttp_unsupported_mode_skipped() {
@@ -1746,4 +1746,22 @@ proxies:
         !config.proxies.contains_key("vless-xhttp-bad-pad-shape"),
         "proxy with invalid padding shape must be skipped"
     );
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_h3_rejects_plaintext_and_mixed_alpn() {
+    for (tls, alpn) in [(false, "[h3]"), (true, "[h2, h3]"), (true, "[h3-29]")] {
+        let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: {tls}\n    alpn: {alpn}\n    network: xhttp\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert!(!config.proxies.contains_key("invalid"));
+    }
+}
+
+#[tokio::test]
+async fn parse_vless_reality_hybrid_flag_is_typed() {
+    for (flag, valid) in [("true", true), ("false", true), ("'true'", false)] {
+        let yaml = format!("proxies:\n  - name: reality-hybrid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\n      short-id: abcd\n      support-x25519mlkem768: {flag}\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(config.proxies.contains_key("reality-hybrid"), valid);
+    }
 }

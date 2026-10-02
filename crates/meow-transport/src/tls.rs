@@ -80,6 +80,7 @@ pub enum EchOpts {
 pub struct RealityConfig {
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
+    /// Offer standard X25519MLKEM768 first, with the same X25519 fallback.
     pub support_x25519_mlkem768: bool,
 }
 
@@ -394,4 +395,58 @@ impl Transport for TlsLayer {
             TlsBackend::Boring(lazy) => lazy.connect(inner).await,
         }
     }
+}
+
+/// QUIC uses the same trust roots and fingerprint shaping as TCP TLS.
+#[cfg(feature = "xhttp3")]
+pub(crate) fn xhttp3_config(config: &TlsConfig) -> Result<quiche::Config> {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+    if config
+        .sni
+        .as_ref()
+        .is_none_or(|s| s.is_empty() || s.contains('\0'))
+    {
+        return Err(TransportError::Config(
+            "XHTTP/3 requires a nonempty SNI".into(),
+        ));
+    }
+    // These features need connection-specific hooks which this QUIC path
+    // does not supply yet. Fail at load rather than silently weaken TLS.
+    if config.reality.is_some()
+        || config.ech.is_some()
+        || config.client_cert.is_some()
+        || config.cert_pin.is_some()
+        || config.verify_name.is_some()
+        || config.min_version == Some(TlsVersion::Tls12)
+        || config.max_version == Some(TlsVersion::Tls12)
+    {
+        return Err(TransportError::Config(
+            "XHTTP/3: REALITY, ECH, mTLS, pins, verify-name and TLS 1.2 are unsupported".into(),
+        ));
+    }
+    let mut ssl =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| TransportError::Tls(e.to_string()))?;
+    boring_backend::apply_fingerprint(&mut ssl, config)?;
+    if config.skip_cert_verify {
+        ssl.set_verify(SslVerifyMode::NONE);
+    } else {
+        ssl.set_verify(SslVerifyMode::PEER);
+        ssl.set_cert_store_builder(boring_backend::build_root_store(&config.additional_roots)?);
+    }
+    let mut quic = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
+        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    quic.set_application_protos(&[b"h3"])
+        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    quic.set_max_idle_timeout(30_000);
+    quic.set_initial_max_data(512 * 1024);
+    quic.set_max_connection_window(512 * 1024);
+    quic.set_max_stream_window(256 * 1024);
+    quic.set_initial_max_stream_data_bidi_local(256 * 1024);
+    quic.set_initial_max_stream_data_bidi_remote(256 * 1024);
+    quic.set_initial_max_stream_data_uni(16 * 1024);
+    quic.set_initial_max_streams_bidi(2);
+    quic.set_initial_max_streams_uni(3);
+    quic.set_max_recv_udp_payload_size(1500);
+    quic.set_max_send_udp_payload_size(1200);
+    Ok(quic)
 }

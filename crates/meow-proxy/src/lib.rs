@@ -200,3 +200,6 @@ pub(crate) fn transport_to_proxy_err(e: meow_transport::TransportError) -> meow_
         other => meow_common::MeowError::Proxy(other.to_string()),
     }
 }
+
+#[cfg(feature = "vless")]
+mod xhttp3_dialer;
