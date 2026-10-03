@@ -321,6 +321,7 @@ fn build(
     for (name, value) in &config.extra_headers {
         parts.header(name, value)?;
     }
+    super::browser::apply(&mut parts.headers);
     if let Some(data) = payload {
         let p = placement(&config.uplink_data_placement, "body");
         if matches!(p, "header" | "cookie") {

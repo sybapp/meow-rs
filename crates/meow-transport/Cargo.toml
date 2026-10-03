@@ -41,6 +41,9 @@ boring-tls = ["tls", "reality"]
 # the same RustCrypto ML-KEM dependency as VLESS Encryption.
 reality = [
     "tls",
+    "dep:h2",
+    "dep:http",
+    "dep:chacha20poly1305",
     "dep:rand",
     "dep:x25519-dalek",
     "dep:ml-kem",
@@ -212,6 +215,7 @@ foreign-types      = { workspace = true, optional = true }
 webpki-root-certs  = { version = "1", optional = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 serde_json = { workspace = true }
 # `test-util` enables paused-time tests (start_paused / time::advance) —
 # not part of tokio's `full` set.

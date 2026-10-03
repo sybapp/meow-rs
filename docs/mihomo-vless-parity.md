@@ -12,11 +12,12 @@ the whole meow kernel, or even every VLESS transport setting, equals mihomo.
 | Metadata | Path/query/header/cookie sessions and sequence numbers; configurable upload method | Reserved methods still depend on peer support (mihomo server treats GET as download) |
 | Packet upload | Finite requests, monotonic sequence, timer/size flushing, bounded serial acknowledgement, shutdown flush | No connection reuse manager/XMUX; no HTTP/1.1 request pool |
 | Payload | Body/auto, header and cookie; unpadded URL-safe Base64 chunking | Header/cookie packets use a conservative 8 KiB raw payload cap |
-| Padding | Repeat-X/tokenish, header/queryInHeader/query/cookie; metadata applied after padding | Browser default request headers/UA generation |
+| Padding | Repeat-X/tokenish, header/queryInHeader/query/cookie; metadata applied after padding; process-sampled browser header/UA presets | Full browser ClientHello profiles (HTTP headers are implemented) |
 | Sessions | Legacy hex, UUID, all nine predefined tables and custom ASCII alphabets; upstream entropy threshold | Allocation and unsafe header/cookie byte restrictions below |
-| REALITY keys | X25519 and optional standard X25519MLKEM768, classical fallback | Other key-share groups and HelloRetryRequest |
+| REALITY keys | X25519 and optional standard X25519MLKEM768, classical fallback; HelloRetryRequest with P-256/P-384/P-521 and cookies | Full browser-specific group/key-share layouts |
 | REALITY framing | Fragmented plaintext ServerHello, fragmented/coalesced encrypted handshake messages | Full browser ClientHello profiles remain unimplemented; configured fingerprint produces an explicit warning |
-| REALITY authentication | Authenticated client version 1.8.2, certificate HMAC, TLS CertificateVerify signature bound to the transcript, server/client Finished | Ordinary X.509 fallback/camouflage request; NTP-adjusted clock; additional TLS cipher suites |
+| REALITY authentication | Authenticated client version 1.8.2, certificate HMAC, generic TLS CertificateVerify bound to the transcript, server/client Finished; AES-128/SHA-256, AES-256/SHA-384, ChaCha20/SHA-256; trusted X.509 cover fallback and bounded H2 camouflage GET | NTP-adjusted clock; full browser ClientHello profiles |
+| REALITY post-handshake | Fragmented NewSessionTicket/KeyUpdate; traffic-secret updates and requested response; bounded control buffering; buffered old-epoch data stays before the update | Ticket resumption remains disabled, matching mihomo REALITY |
 | Vision | Existing TCP/TLS/REALITY record bypass and tests remain in place | This increment does not expand Vision compatibility or certify every mihomo Vision behavior |
 
 ## Changes to earlier defaults
@@ -70,7 +71,10 @@ H2/H3, all session/sequence/payload placement combinations, upload methods,
 tables, padding, literal paths, and the bounded maximum packet size.
 
 The same harness has a separate REALITY-authenticated test endpoint using the
-Go TLS 1.3 engine. It validates the auth header and real TLS signatures, tests
+Go TLS 1.3 engine. It additionally forces P-256/P-384/P-521 retries and the
+ChaCha20 suite, tests trusted/untrusted/name-mismatched ordinary cover certificates,
+and records the camouflage request. Go crypto primitives generate checked-in
+key-schedule, Finished, record and traffic-update vectors for all three suites. It validates the auth header and real TLS signatures, tests
 classical/hybrid handshakes and ServerHello fragmentation, and deliberately
 signs CertificateVerify with an unrelated key to verify rejection. This is an
 independent cryptographic/protocol fixture, **not** an Xray deployment or a live
@@ -84,3 +88,11 @@ MEOW_XHTTP_PEER_BIN=/tmp/mihomo-xhttp-peer cargo test -p meow-transport \
 
 CI builds the peer and requires this suite. Missing peer binaries fail loudly.
 Actual node tests remain opt-in; credentials must stay outside committed files.
+
+## Working scope
+
+The iOS work is paused. Existing device/simulator build files are retained, but
+this work does not add device, NetworkExtension, RSS/OOM or battery validation.
+HTTP/1.1, independently configured download endpoints, and reusable HTTP
+transport pools are still absent from this committed increment. No previous
+uncommitted prototype is counted as implemented compatibility here.

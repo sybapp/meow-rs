@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+mod browser;
 mod packet;
 mod request;
 

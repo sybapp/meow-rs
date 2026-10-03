@@ -52,6 +52,10 @@ use crate::{Result, Stream, Transport, TransportError};
 
 pub(crate) mod boring_backend;
 pub(crate) mod boring_stream;
+#[cfg(any(feature = "reality", feature = "restls"))]
+pub(crate) mod certificate;
+#[cfg(any(feature = "reality", feature = "restls"))]
+pub(crate) mod key_share;
 
 use boring_backend::{BoringInner, LazyBoringInner};
 

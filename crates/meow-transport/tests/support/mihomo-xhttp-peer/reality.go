@@ -7,7 +7,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -22,6 +24,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/metacubex/http"
+	"github.com/metacubex/http/http2"
 	"github.com/metacubex/tls"
 	"golang.org/x/crypto/hkdf"
 )
@@ -127,7 +131,7 @@ func realityAuth(hello []byte, static *ecdh.PrivateKey) ([]byte, error) {
 	return auth, nil
 }
 
-func serveReality(count int64, fragment, badSignature bool) {
+func serveReality(count int64, fragment, badSignature bool, curve string, cover bool) {
 	static, err := ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{0x23}, 32))
 	if err != nil {
 		panic(err)
@@ -136,7 +140,25 @@ func serveReality(count int64, fragment, badSignature bool) {
 	if err != nil {
 		panic(err)
 	}
-	json.NewEncoder(os.Stdout).Encode(map[string]any{"address": listener.Addr().String(), "public_key": static.PublicKey().Bytes()})
+	info := map[string]any{"address": listener.Addr().String(), "public_key": static.PublicKey().Bytes()}
+	var coverCert tls.Certificate
+	if cover {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			panic(err)
+		}
+		template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"example.org"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			BasicConstraintsValid: true, IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		cert, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		if err != nil {
+			panic(err)
+		}
+		coverCert = tls.Certificate{Certificate: [][]byte{cert}, PrivateKey: key}
+		info["certificate"] = cert
+	}
+	json.NewEncoder(os.Stdout).Encode(info)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -175,12 +197,41 @@ func serveReality(count int64, fragment, badSignature bool) {
 				_, private, _ = ed25519.GenerateKey(rand.Reader)
 			}
 			raw := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(append(header, body...)), conn), fragment: fragment}
-			server := tls.Server(raw, &tls.Config{MinVersion: tls.VersionTLS13,
-				Certificates: []tls.Certificate{{Certificate: [][]byte{certificate}, PrivateKey: private}}})
+			var curves []tls.CurveID
+			switch curve {
+			case "":
+			case "p256":
+				curves = []tls.CurveID{tls.CurveP256}
+			case "p384":
+				curves = []tls.CurveID{tls.CurveP384}
+			case "p521":
+				curves = []tls.CurveID{tls.CurveP521}
+			default:
+				panic("unknown curve")
+			}
+			certs := []tls.Certificate{{Certificate: [][]byte{certificate}, PrivateKey: private}}
+			if cover {
+				certs = []tls.Certificate{coverCert}
+			}
+			server := tls.Server(raw, &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: curves,
+				NextProtos: []string{"h2"}, Certificates: certs})
 			if err := server.Handshake(); err != nil {
 				if !badSignature {
 					fmt.Fprintln(os.Stderr, err)
 				}
+				return
+			}
+			if cover {
+				h2 := new(http2.Server)
+				h2.ServeConn(server, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					cookie, _ := r.Cookie("padding")
+					padding := ""
+					if cookie != nil {
+						padding = cookie.Value
+					}
+					json.NewEncoder(os.Stdout).Encode(map[string]any{"method": r.Method, "path": r.URL.Path, "ua": r.UserAgent(), "padding": padding})
+					w.WriteHeader(200)
+				})})
 				return
 			}
 			if _, err := io.CopyN(server, server, count); err != nil {

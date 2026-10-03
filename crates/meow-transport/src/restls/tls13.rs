@@ -63,19 +63,9 @@ const DUMMY_CCS: [u8; 6] = [
     0x01,
 ];
 
-/// Cover-certificate verification policy — shared by the TLS 1.3 and 1.2
-/// record-level handshakes (upstream `ca` verifier semantics).
-#[derive(Default)]
-pub(crate) struct CertPolicy {
-    /// Skip verification entirely (`skip-cert-verify`).
-    pub(crate) skip_cert_verify: bool,
-    /// DNS name to check — `name-cert-verify` override or SNI.
-    pub(crate) verify_name: Option<String>,
-    /// SHA-256 fingerprint of the cover cert (leaf or CA pin).
-    pub(crate) cert_pin: Option<[u8; 32]>,
-    /// Extra CA roots (DER) on top of the Mozilla bundle.
-    pub(crate) additional_roots: Vec<Vec<u8>>,
-}
+pub(crate) use crate::tls::certificate::{
+    parse_certificate_list, verify_certificate_chain, verify_signature, CertPolicy,
+};
 
 /// Shared TLS 1.3 driver configuration — resolved options (restls's
 /// `RestlsConfig`, jls's `JlsConfig`).
@@ -86,108 +76,7 @@ pub(crate) struct Tls13Config {
     pub(crate) cert: CertPolicy,
 }
 
-/// One ephemeral key share — one per advertised group so the cover never
-/// needs HelloRetryRequest (which the restls server cannot relay; upstream
-/// has the same constraint).
-pub(crate) enum Ecdhe {
-    X25519([u8; 32]),
-    P256(boring::ec::EcKey<boring::pkey::Private>),
-    P384(boring::ec::EcKey<boring::pkey::Private>),
-}
-
-pub(crate) struct KeyShare {
-    pub(crate) group: u16,
-    pub(crate) key: Ecdhe,
-    /// Uncompressed public bytes as sent in the `key_share` extension.
-    pub(crate) public: Vec<u8>,
-}
-
-impl KeyShare {
-    pub(crate) fn generate(group: u16) -> Result<Self> {
-        match group {
-            GROUP_X25519 => {
-                let mut private = rand::random::<[u8; 32]>();
-                private[0] &= 248;
-                private[31] &= 127;
-                private[31] |= 64;
-                let public = x25519_dalek::x25519(private, x25519_dalek::X25519_BASEPOINT_BYTES);
-                Ok(Self {
-                    group,
-                    key: Ecdhe::X25519(private),
-                    public: public.to_vec(),
-                })
-            }
-            GROUP_P256 | GROUP_P384 => {
-                let nid = if group == GROUP_P256 {
-                    boring::nid::Nid::X9_62_PRIME256V1
-                } else {
-                    boring::nid::Nid::SECP384R1
-                };
-                let ec_group = boring::ec::EcGroup::from_curve_name(nid)
-                    .map_err(|e| TransportError::Tls(format!("tls13: ec group: {e}")))?;
-                let key = boring::ec::EcKey::generate(&ec_group)
-                    .map_err(|e| TransportError::Tls(format!("tls13: ec generate: {e}")))?;
-                let mut ctx = boring::bn::BigNumContext::new()
-                    .map_err(|e| TransportError::Tls(format!("tls13: bn ctx: {e}")))?;
-                let public = key
-                    .public_key()
-                    .to_bytes(
-                        &ec_group,
-                        boring::ec::PointConversionForm::UNCOMPRESSED,
-                        &mut ctx,
-                    )
-                    .map_err(|e| TransportError::Tls(format!("tls13: ec pubkey: {e}")))?;
-                Ok(Self {
-                    group,
-                    key: if group == GROUP_P256 {
-                        Ecdhe::P256(key)
-                    } else {
-                        Ecdhe::P384(key)
-                    },
-                    public,
-                })
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// ECDHE shared secret with the cover's key share.
-    pub(crate) fn agree(&self, peer_public: &[u8]) -> Result<Vec<u8>> {
-        match &self.key {
-            Ecdhe::X25519(private) => {
-                let peer: [u8; 32] = peer_public
-                    .try_into()
-                    .map_err(|_| TransportError::Tls("tls13: bad X25519 share".into()))?;
-                let out = x25519_dalek::x25519(*private, peer);
-                if out == [0u8; 32] {
-                    return Err(TransportError::Tls("tls13: X25519 low-order".into()));
-                }
-                Ok(out.to_vec())
-            }
-            Ecdhe::P256(key) | Ecdhe::P384(key) => {
-                let group = key.group();
-                let mut ctx = boring::bn::BigNumContext::new()
-                    .map_err(|e| TransportError::Tls(format!("tls13: bn ctx: {e}")))?;
-                let point = boring::ec::EcPoint::from_bytes(group, peer_public, &mut ctx)
-                    .map_err(|e| TransportError::Tls(format!("tls13: bad EC share: {e}")))?;
-                let peer_key = boring::ec::EcKey::from_public_key(group, &point)
-                    .map_err(|e| TransportError::Tls(format!("tls13: ec peer: {e}")))?;
-                let pkey = boring::pkey::PKey::from_ec_key(peer_key)
-                    .map_err(|e| TransportError::Tls(format!("tls13: pkey: {e}")))?;
-                let ours = boring::pkey::PKey::from_ec_key(key.clone())
-                    .map_err(|e| TransportError::Tls(format!("tls13: pkey: {e}")))?;
-                let mut deriver = boring::derive::Deriver::new(&ours)
-                    .map_err(|e| TransportError::Tls(format!("tls13: derive: {e}")))?;
-                deriver
-                    .set_peer(&pkey)
-                    .map_err(|e| TransportError::Tls(format!("tls13: derive peer: {e}")))?;
-                deriver
-                    .derive_to_vec()
-                    .map_err(|e| TransportError::Tls(format!("tls13: derive: {e}")))
-            }
-        }
-    }
-}
+pub(crate) use crate::tls::key_share::KeyShare;
 
 /// Offset of `random` inside a serialized ClientHello/ServerHello wire
 /// message: type(1) ‖ length(3) ‖ legacy_version(2).
@@ -681,27 +570,6 @@ impl ServerFlightGuard {
     }
 }
 
-/// TLS 1.3 `Certificate` body → DER list (context byte + u24 list + entries).
-pub(crate) fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let mut pos = 0;
-    let ctx_len = take_u8(body, &mut pos)? as usize;
-    take(body, &mut pos, ctx_len)?; // request_context
-    let list_len = take_u24(body, &mut pos)?;
-    let list = take(body, &mut pos, list_len)?;
-    let mut certs = Vec::new();
-    let mut lp = 0;
-    while lp < list.len() {
-        let clen = take_u24(list, &mut lp)?;
-        certs.push(take(list, &mut lp, clen)?.to_vec());
-        let ext_len = take_u16(list, &mut lp)? as usize;
-        take(list, &mut lp, ext_len)?; // per-cert extensions
-    }
-    if certs.is_empty() {
-        return Err(TransportError::Tls("tls13: empty certificate list".into()));
-    }
-    Ok(certs)
-}
-
 /// CV schemes legal in TLS 1.3 — `SIG_ALGS` minus PKCS#1 v1.5
 /// (`0x0401`/`0x0501`), which RFC 8446 §4.4.3 forbids in
 /// CertificateVerify even when offered in `signature_algorithms`.
@@ -728,166 +596,6 @@ fn verify_certificate_verify(
     content.extend_from_slice(b"TLS 1.3, server CertificateVerify\x00");
     content.extend_from_slice(&cipher.hash().digest(transcript));
     verify_signature(scheme, signature, &content, leaf_der)
-}
-
-/// Verify a TLS `SignatureScheme` signature over `content` with the leaf
-/// cert's public key — shared by TLS 1.3 CertificateVerify and the TLS 1.2
-/// ServerKeyExchange signature.
-pub(crate) fn verify_signature(
-    scheme: u16,
-    signature: &[u8],
-    content: &[u8],
-    leaf_der: &[u8],
-) -> Result<()> {
-    let cert = boring::x509::X509::from_der(leaf_der)
-        .map_err(|e| TransportError::Tls(format!("tls13: bad leaf cert: {e}")))?;
-    let pkey = cert
-        .public_key()
-        .map_err(|e| TransportError::Tls(format!("tls13: leaf pubkey: {e}")))?;
-
-    use boring::sign::Verifier;
-    let (md, pss) = match scheme {
-        // RSA-PSS with digest-length salt.
-        0x0804 => (Some(boring::hash::MessageDigest::sha256()), true),
-        0x0805 => (Some(boring::hash::MessageDigest::sha384()), true),
-        0x0806 => (Some(boring::hash::MessageDigest::sha512()), true),
-        // RSA PKCS#1 v1.5 and ECDSA share the plain-digest path.
-        0x0401 | 0x0403 => (Some(boring::hash::MessageDigest::sha256()), false),
-        0x0501 | 0x0503 => (Some(boring::hash::MessageDigest::sha384()), false),
-        0x0601 | 0x0603 => (Some(boring::hash::MessageDigest::sha512()), false),
-        // Ed25519 — no digest.
-        0x0807 => (None, false),
-        other => {
-            return Err(TransportError::Tls(format!(
-                "tls13: unsupported CV scheme 0x{other:04x}"
-            )))
-        }
-    };
-    let mut verifier = match md {
-        Some(md) => Verifier::new(md, &pkey),
-        None => Verifier::new_without_digest(&pkey),
-    }
-    .map_err(|e| TransportError::Tls(format!("tls13: CV verifier: {e}")))?;
-    if pss {
-        let md = md.expect("pss digest");
-        verifier
-            .set_rsa_padding(boring::rsa::Padding::PKCS1_PSS)
-            .map_err(|e| TransportError::Tls(format!("tls13: CV pad: {e}")))?;
-        verifier
-            .set_rsa_pss_saltlen(boring::sign::RsaPssSaltlen::DIGEST_LENGTH)
-            .map_err(|e| TransportError::Tls(format!("tls13: CV salt: {e}")))?;
-        verifier
-            .set_rsa_mgf1_md(md)
-            .map_err(|e| TransportError::Tls(format!("tls13: CV mgf1: {e}")))?;
-    }
-
-    verifier
-        .update(content)
-        .map_err(|e| TransportError::Tls(format!("tls13: CV update: {e}")))?;
-    let ok = verifier
-        .verify(signature)
-        .map_err(|e| TransportError::Tls(format!("tls13: CV verify: {e}")))?;
-    if !ok {
-        return Err(TransportError::Tls(
-            "tls13: CertificateVerify mismatch".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Verify the cover certificate chain per `policy` — `cert_pin` (leaf or CA
-/// pin) → `skip_cert_verify` → Mozilla roots + `name` check.
-pub(crate) fn verify_certificate_chain(
-    policy: &CertPolicy,
-    name: &str,
-    certs: &[Vec<u8>],
-) -> Result<()> {
-    use boring::stack::Stack;
-    use boring::x509::X509StoreContext;
-    use sha2::Sha256;
-
-    let leaf = boring::x509::X509::from_der(&certs[0])
-        .map_err(|e| TransportError::Tls(format!("tls13: leaf DER: {e}")))?;
-    let mut chain = Stack::new().map_err(|e| TransportError::Tls(format!("tls13: stack: {e}")))?;
-    for der in &certs[1..] {
-        let c = boring::x509::X509::from_der(der)
-            .map_err(|e| TransportError::Tls(format!("tls13: chain DER: {e}")))?;
-        chain
-            .push(c)
-            .map_err(|e| TransportError::Tls(format!("tls13: chain push: {e}")))?;
-    }
-
-    // Fingerprint pin — upstream `ca.NewFingerprintVerifier` semantics:
-    // a pin matching the leaf accepts directly; a pin matching a chain
-    // cert verifies the chain up to the pinned CA plus the name check.
-    if let Some(pin) = &policy.cert_pin {
-        for (i, der) in certs.iter().enumerate() {
-            use subtle::ConstantTimeEq;
-            if bool::from(Sha256::digest(der).as_slice().ct_eq(pin.as_slice())) {
-                if i == 0 {
-                    return Ok(());
-                }
-                // CA pin: verify leaf against a store holding the pinned cert.
-                let pinned = boring::x509::X509::from_der(der)
-                    .map_err(|e| TransportError::Tls(format!("tls13: pinned cert DER: {e}")))?;
-                let mut builder = boring::x509::store::X509StoreBuilder::new()
-                    .map_err(|e| TransportError::Tls(format!("tls13: store: {e}")))?;
-                builder
-                    .add_cert(pinned)
-                    .map_err(|e| TransportError::Tls(format!("tls13: pin store: {e}")))?;
-                builder
-                    .verify_param_mut()
-                    .set_host(name)
-                    .map_err(|e| TransportError::Tls(format!("tls13: pin host: {e}")))?;
-                let store = builder.build();
-                let mut ctx = X509StoreContext::new()
-                    .map_err(|e| TransportError::Tls(format!("tls13: ctx: {e}")))?;
-                let (verified, err) = ctx
-                    .init(&store, &leaf, &chain, |c| {
-                        c.verify_cert().map(|ok| (ok, c.verify_result().err()))
-                    })
-                    .map_err(|e| TransportError::Tls(format!("tls13: pin verify: {e}")))?;
-                return if verified {
-                    Ok(())
-                } else {
-                    Err(TransportError::Tls(format!(
-                        "tls13: pinned CA did not verify the chain: {}",
-                        err.map_or("unknown", |e| e.error_string())
-                    )))
-                };
-            }
-        }
-        return Err(TransportError::Tls(
-            "tls13: certificate fingerprint mismatch".into(),
-        ));
-    }
-
-    if policy.skip_cert_verify {
-        return Ok(());
-    }
-
-    let mut builder = crate::tls::boring_backend::build_root_store(&policy.additional_roots)?;
-    if !name.is_empty() {
-        builder
-            .verify_param_mut()
-            .set_host(name)
-            .map_err(|e| TransportError::Tls(format!("tls13: verify host: {e}")))?;
-    }
-    let store = builder.build();
-    let mut ctx =
-        X509StoreContext::new().map_err(|e| TransportError::Tls(format!("tls13: ctx: {e}")))?;
-    let (verified, err) = ctx
-        .init(&store, &leaf, &chain, |c| {
-            c.verify_cert().map(|ok| (ok, c.verify_result().err()))
-        })
-        .map_err(|e| TransportError::Tls(format!("tls13: verify: {e}")))?;
-    if !verified {
-        return Err(TransportError::Tls(format!(
-            "tls13: certificate verification failed: {}",
-            err.map_or("unknown", |e| e.error_string())
-        )));
-    }
-    Ok(())
 }
 
 // ---- key schedule -------------------------------------------------------
@@ -1310,10 +1018,6 @@ pub(crate) fn take_u8(input: &[u8], pos: &mut usize) -> Result<u8> {
 pub(crate) fn take_u16(input: &[u8], pos: &mut usize) -> Result<u16> {
     let b = take(input, pos, 2)?;
     Ok(u16::from_be_bytes([b[0], b[1]]))
-}
-
-pub(crate) fn take_u24(input: &[u8], pos: &mut usize) -> Result<usize> {
-    Ok(read_u24(take(input, pos, 3)?))
 }
 
 pub(crate) fn read_u24(b: &[u8]) -> usize {

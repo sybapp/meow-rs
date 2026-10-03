@@ -29,9 +29,15 @@ func main() {
 	badSignature := flag.Bool("bad-signature", false, "sign CertificateVerify with an unrelated key")
 	settings := flag.String("config", "{}", "XHTTP config JSON")
 	count := flag.Int64("bytes", 0, "echo exactly this many bytes")
+	curve := flag.String("curve", "", "force a TLS curve/HelloRetryRequest: p256,p384,p521")
+	cover := flag.Bool("cover", false, "use ordinary trusted cover certificate and capture camouflage")
 	flag.Parse()
+	if *protocol == "cipher-vectors" {
+		cipherVectors()
+		return
+	}
 	if *protocol == "reality" {
-		serveReality(*count, *fragment, *badSignature)
+		serveReality(*count, *fragment, *badSignature, *curve, *cover)
 		return
 	}
 	var cfg xhttp.Config
