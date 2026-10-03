@@ -519,6 +519,15 @@ mod vless_tests {
 
     #[tokio::test]
     async fn vless_over_xhttp_roundtrip() {
+        vless_xhttp_roundtrip("stream-one").await;
+    }
+
+    #[tokio::test]
+    async fn vless_over_xhttp_stream_up_roundtrip() {
+        vless_xhttp_roundtrip("stream-up").await;
+    }
+
+    async fn vless_xhttp_roundtrip(mode: &'static str) {
         use bytes::Bytes;
         use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
 
@@ -537,7 +546,26 @@ mod vless_tests {
                         return;
                     };
 
+                    let mut download = None;
                     while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        if request.method() == http::Method::GET {
+                            assert_eq!(mode, "stream-up");
+                            download = Some((request.headers()["X-Session-Id"].clone(), respond));
+                            continue;
+                        }
+                        assert_eq!(request.method(), http::Method::POST);
+                        if mode == "stream-up" {
+                            let (session, download_response) =
+                                download.take().expect("GET precedes POST");
+                            assert_eq!(session, request.headers()["X-Session-Id"]);
+                            respond
+                                .send_response(
+                                    http::Response::builder().status(204).body(()).unwrap(),
+                                    true,
+                                )
+                                .unwrap();
+                            respond = download_response;
+                        }
                         // Send 200 OK response header lazily to start the bidirectional stream
                         let response = http::Response::builder().status(200).body(()).unwrap();
                         let mut send_body = respond.send_response(response, false).unwrap();
@@ -611,6 +639,11 @@ mod vless_tests {
         let xhttp_cfg = XhttpConfig {
             path: "/xhttp-vless".into(),
             hosts: vec!["xhttp.test.com".into()],
+            mode: mode.into(),
+            session_placement: "header".into(),
+            session_key: "X-Session-Id".into(),
+            session_table: "Base62".into(),
+            session_length: (16, 24),
             ..Default::default()
         };
         chain.push(Box::new(XhttpLayer::new(xhttp_cfg)));
@@ -952,4 +985,55 @@ mod connect_over_tests {
         conn.read_exact(&mut buf).await.expect("read_exact failed");
         assert_eq!(&buf, payload, "relay echo mismatch");
     }
+}
+
+#[cfg(feature = "hysteria2")]
+#[path = "../../meow-transport/tests/support/xhttp3_peer.rs"]
+mod xhttp3_peer;
+
+#[cfg(feature = "hysteria2")]
+#[tokio::test]
+async fn vless_over_xhttp3_stream_up_roundtrip() {
+    use meow_common::{Metadata, Network, ProxyAdapter};
+    use meow_proxy::{TransportChain, VlessAdapter};
+    use meow_transport::{tls::TlsConfig, xhttp::XhttpConfig, xhttp3::Xhttp3Client};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let peer = xhttp3_peer::peer("127.0.0.1:0", true, 200, 204, true, true).await;
+    let mut tls = TlsConfig::new("example.org");
+    tls.additional_roots.push(peer.root.clone());
+    let cfg = XhttpConfig {
+        mode: "stream-up".into(),
+        hosts: vec!["example.org".into()],
+        ..Default::default()
+    };
+    let client = Xhttp3Client::new(cfg, &tls).unwrap();
+    let adapter = VlessAdapter::new(
+        "h3",
+        "127.0.0.1",
+        peer.addr.port(),
+        vless_tests::TEST_UUID,
+        None,
+        false,
+        TransportChain::empty(),
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+    )
+    .with_xhttp3(client)
+    .unwrap();
+    let meta = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some("127.0.0.1".parse().unwrap()),
+        dst_port: 80,
+        ..Default::default()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut conn = adapter.dial_tcp(&meta).await.unwrap();
+        conn.write_all(b"VLESS over QUIC").await.unwrap();
+        conn.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        conn.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"VLESS over QUIC");
+        peer.task.await.unwrap();
+    })
+    .await
+    .unwrap();
 }

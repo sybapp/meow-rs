@@ -570,3 +570,50 @@ async fn tls_cert_pin_mismatch_rejected() {
         "non-matching pin must reject the handshake"
     );
 }
+
+#[tokio::test]
+async fn explicit_verify_name_still_verifies_with_skip_cert_verify() {
+    install_crypto_provider();
+    for (name, accepted) in [("real.example.com", true), ("wrong.example.com", false)] {
+        let (cert, key, _, _) = gen_cert(&["real.example.com"]);
+        let (addr, _) = spawn_tls_server(ServerOptions {
+            cert_der: cert.clone(),
+            key_der: key,
+            server_alpn: vec![],
+            require_client_cert_ca: None,
+        })
+        .await;
+        let config = TlsConfig {
+            skip_cert_verify: true,
+            verify_name: Some(name.into()),
+            additional_roots: vec![cert.as_ref().to_vec()],
+            ..TlsConfig::new("different.example.com")
+        };
+        assert_eq!(tls_connect(addr, &config).await.is_ok(), accepted, "{name}");
+    }
+}
+
+#[test]
+fn mismatched_client_identity_is_rejected_before_dial() {
+    install_crypto_provider();
+    let (_, _, certificate, _) = gen_cert(&["client.example"]);
+    let (_, _, _, unrelated_key) = gen_cert(&["other.example"]);
+    let mut config = TlsConfig::new("server.example");
+    config.client_cert = Some(ClientCert {
+        cert_pem: certificate.into_bytes(),
+        key_pem: unrelated_key.into_bytes(),
+    });
+    assert!(
+        TlsLayer::new(&config).is_err(),
+        "TCP must reject an unrelated client key at configuration time"
+    );
+    #[cfg(feature = "xhttp3")]
+    assert!(
+        meow_transport::xhttp3::Xhttp3Client::new(
+            meow_transport::xhttp::XhttpConfig::default(),
+            &config
+        )
+        .is_err(),
+        "QUIC must reject an unrelated client key at configuration time"
+    );
+}

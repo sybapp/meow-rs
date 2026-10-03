@@ -12,7 +12,7 @@ homepage.workspace = true
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
 trojan = []
-vless = []
+vless = ["meow-transport/xhttp3"]
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
 vless-vision = ["vless"]
 # VLESS post-quantum Encryption layer (`encryption: mlkem768x25519plus...`),

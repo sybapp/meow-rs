@@ -116,8 +116,8 @@ pub struct TlsConfig {
     /// Hostname the peer certificate is verified against when it differs
     /// from the connection SNI (mihomo's `name-cert-verify` / Go
     /// `VerifyPeerCertificate` name override).  `None` → verify against
-    /// `sni`.  Ignored when `skip_cert_verify` is set or on the REALITY
-    /// path.
+    /// `sni`. An explicit override enables name/CA verification even when
+    /// `skip_cert_verify` is set, matching mihomo. Ignored on REALITY.
     pub verify_name: Option<String>,
 
     /// Certificate pinning by SHA-256 hash of a cert in the presented
@@ -259,7 +259,7 @@ impl TlsLayer {
     /// * [`TransportError::Config`] — `reality` is set without the `reality` feature.
     /// * [`TransportError::Config`] — a DER in `additional_roots` is malformed.
     /// * [`TransportError::Config`] — `client_cert` PEM is unparseable.
-    /// * [`TransportError::Tls`] — client cert + key don't match.
+    /// * [`TransportError::Config`] — client cert + key don't match.
     pub fn new(config: &TlsConfig) -> Result<Self> {
         #[cfg(not(feature = "reality"))]
         if config.reality.is_some() {
@@ -291,7 +291,7 @@ impl TlsLayer {
         // Warn at construction, once per proxy — the backend stays silent so
         // a lazily-built (and cached) SSL_CTX doesn't swallow the warning
         // for later proxies sharing it.
-        if config.skip_cert_verify {
+        if config.skip_cert_verify && config.verify_name.is_none() && config.cert_pin.is_none() {
             warn!(
                 sni = ?config.sni,
                 "skip-cert-verify=true: TLS certificate verification is disabled; \
@@ -394,4 +394,68 @@ impl Transport for TlsLayer {
             TlsBackend::Boring(lazy) => lazy.connect(inner).await,
         }
     }
+}
+
+/// QUIC uses the same trust roots and fingerprint shaping as TCP TLS.
+#[cfg(feature = "xhttp3")]
+pub(crate) fn xhttp3_config(config: &TlsConfig) -> Result<quiche::Config> {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+    if config
+        .sni
+        .as_ref()
+        .is_none_or(|s| s.is_empty() || s.contains('\0'))
+    {
+        return Err(TransportError::Config(
+            "XHTTP/3 requires a nonempty SNI".into(),
+        ));
+    }
+    // These features need connection-specific hooks which this QUIC path
+    // does not supply yet. Fail at load rather than silently weaken TLS.
+    if config.reality.is_some()
+        || config.ech.is_some()
+        || config.min_version == Some(TlsVersion::Tls12)
+        || config.max_version == Some(TlsVersion::Tls12)
+    {
+        return Err(TransportError::Config(
+            "XHTTP/3: REALITY, ECH and TLS 1.2 are unsupported".into(),
+        ));
+    }
+    if config
+        .verify_name
+        .as_ref()
+        .is_some_and(|s| s.is_empty() || s.len() > 255 || s.contains('\0'))
+    {
+        return Err(TransportError::Config(
+            "XHTTP/3 verify-name must be 1–255 bytes without NUL".into(),
+        ));
+    }
+    let mut ssl =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| TransportError::Tls(e.to_string()))?;
+    boring_backend::apply_fingerprint(&mut ssl, config)?;
+    if config.skip_cert_verify && config.verify_name.is_none() {
+        ssl.set_verify(SslVerifyMode::NONE);
+    } else {
+        ssl.set_verify(SslVerifyMode::PEER);
+        ssl.set_cert_store_builder(boring_backend::build_root_store(&config.additional_roots)?);
+    }
+    boring_backend::apply_client_identity(&mut ssl, config)?;
+    ssl.set_session_cache_size(64);
+    let mut quic = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
+        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    quic.set_application_protos(&[b"h3"])
+        .map_err(|e| TransportError::Tls(e.to_string()))?;
+    // Match mihomo/quic-go; keep-alive belongs to the connection driver.
+    quic.set_max_idle_timeout(300_000);
+    quic.set_initial_max_data(512 * 1024);
+    quic.set_max_connection_window(512 * 1024);
+    quic.set_max_stream_window(256 * 1024);
+    quic.set_initial_max_stream_data_bidi_local(256 * 1024);
+    quic.set_initial_max_stream_data_bidi_remote(256 * 1024);
+    quic.set_initial_max_stream_data_uni(16 * 1024);
+    // Only the client opens bidirectional HTTP requests.
+    quic.set_initial_max_streams_bidi(0);
+    quic.set_initial_max_streams_uni(3);
+    quic.set_max_recv_udp_payload_size(1500);
+    quic.set_max_send_udp_payload_size(1200);
+    Ok(quic)
 }

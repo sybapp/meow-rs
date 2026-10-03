@@ -281,15 +281,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HttpObfs<S> {
 }
 
 fn find_double_crlf(data: &[u8]) -> Option<usize> {
-    if data.len() < 4 {
-        return None;
-    }
-    for i in 0..=data.len() - 4 {
-        if &data[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
+    data.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 // ---------------------------------------------------------------------------
