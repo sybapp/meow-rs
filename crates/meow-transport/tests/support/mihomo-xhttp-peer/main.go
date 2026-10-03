@@ -87,8 +87,9 @@ func main() {
 				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 			}
 			listener = tls.NewListener(listener, tlsConfig)
+			clientPEM, clientKeyPEM := peerClientIdentity(identity)
 			pin := sha256.Sum256(der)
-			identityInfo = map[string]any{"fingerprint": fmt.Sprintf("%x", pin), "certificate": der, "certificate-pem": certPEM, "private-key-pem": keyPEM}
+			identityInfo = map[string]any{"fingerprint": fmt.Sprintf("%x", pin), "client-certificate-pem": clientPEM, "client-private-key-pem": clientKeyPEM, "certificate": der, "certificate-pem": certPEM, "private-key-pem": keyPEM}
 		}
 		var outputMu sync.Mutex
 		var nextID atomic.Int64
@@ -148,15 +149,22 @@ func main() {
 		}
 		return
 	}
-	identity, certificate, _, _ := peerIdentity()
+	identity, certificate, certPEM, keyPEM := peerIdentity()
 	socket, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
 	}
-	server := &http3.Server{Handler: handler, TLSConfig: &tls.Config{
-		Certificates: []tls.Certificate{identity},
-	}}
-	json.NewEncoder(os.Stdout).Encode(map[string]any{"address": socket.LocalAddr().String(), "certificate": certificate})
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{identity}}
+	if *clientAuth {
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM([]byte(certPEM))
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	server := &http3.Server{Handler: handler, TLSConfig: tlsConfig}
+	clientPEM, clientKeyPEM := peerClientIdentity(identity)
+	pin := sha256.Sum256(certificate)
+	json.NewEncoder(os.Stdout).Encode(map[string]any{"address": socket.LocalAddr().String(), "certificate": certificate, "client-certificate-pem": clientPEM, "client-private-key-pem": clientKeyPEM, "certificate-pem": certPEM, "private-key-pem": keyPEM, "fingerprint": fmt.Sprintf("%x", pin)})
 	if err := server.Serve(socket); err != nil {
 		panic(err)
 	}

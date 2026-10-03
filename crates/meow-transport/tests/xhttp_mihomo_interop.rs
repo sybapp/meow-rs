@@ -396,3 +396,71 @@ async fn mihomo_h2_reuse_download_probe_isolation_and_reset() {
         }).await.unwrap_or_else(|_| panic!("shared H2 {mode} deadline"));
     }
 }
+
+#[tokio::test]
+async fn mihomo_h3_pins_verify_names_and_mutual_tls() {
+    use meow_transport::tls::ClientCert;
+    // Expected failures must be tested by using the stream too: a TLS 1.3
+    // client may finish its flight before receiving a client-auth rejection.
+    for case in [
+        "roots",
+        "pin",
+        "bad-pin",
+        "name",
+        "bad-name",
+        "ip-sni",
+        "no-client-cert",
+        "truncated-client-chain",
+    ] {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut peer = Command::new(std::env::var("MEOW_XHTTP_PEER_BIN").expect("independent peer required"))
+                .args(["-protocol", "h3", "-require-client-cert", "-bytes", "8193", "-config", "{\"Host\":\"example.org\",\"Path\":\"/tls\",\"Mode\":\"auto\",\"XPaddingBytes\":\"16\"}"])
+                .stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            let mut output = BufReader::new(peer.stdout.take().unwrap());
+            let mut startup = String::new(); output.read_line(&mut startup).await.unwrap();
+            let startup: serde_json::Value = serde_json::from_str(&startup).unwrap();
+            let addr: SocketAddr = startup["address"].as_str().unwrap().parse().unwrap();
+            let mut tls = TlsConfig::new("example.org");
+            tls.additional_roots.push(STANDARD.decode(startup["certificate"].as_str().unwrap()).unwrap());
+            tls.client_cert = Some(ClientCert { cert_pem: startup["client-certificate-pem"].as_str().unwrap().as_bytes().to_vec(), key_pem: startup["client-private-key-pem"].as_str().unwrap().as_bytes().to_vec() });
+            match case {
+                "pin" | "bad-pin" => {
+                    tls.sni = Some("different.example".into());
+                    tls.additional_roots.clear();
+                    tls.skip_cert_verify = true;
+                    let pin = startup["fingerprint"].as_str().unwrap();
+                    let mut bytes = [0;32];
+                    if case == "pin" { for (i, byte) in bytes.iter_mut().enumerate() { *byte = u8::from_str_radix(&pin[i*2..i*2+2],16).unwrap(); } }
+                    tls.cert_pin = Some(bytes);
+                }
+                "name" | "bad-name" | "ip-sni" => {
+                    tls.sni = Some(if case == "ip-sni" { "[127.0.0.1]" } else { "different.example" }.into());
+                    tls.skip_cert_verify = true;
+                    tls.verify_name = Some(if case == "bad-name" { "wrong.example" } else { "example.org" }.into());
+                }
+                "no-client-cert" => tls.client_cert = None,
+                "truncated-client-chain" => {
+                    let cert = &mut tls.client_cert.as_mut().unwrap().cert_pem;
+                    let first = std::str::from_utf8(cert).unwrap().find("-----END CERTIFICATE-----").unwrap() + "-----END CERTIFICATE-----".len();
+                    cert.truncate(first);
+                },
+                _ => {}
+            }
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let local = socket.local_addr().unwrap(); socket.connect(addr).await.unwrap();
+            let client = Xhttp3Client::new(XhttpConfig { scheme: "https".into(), hosts: vec!["example.org".into()], path: "/tls".into(), mode: "stream-one".into(), x_padding_bytes: Some((16,16)), ..Default::default() }, &tls).unwrap();
+            let exchange = async {
+                let mut stream = client.connect(Arc::new(Socket(socket)), local, addr).await.map_err(|e| e.to_string())?;
+                let data = vec![0x4a;8193];
+                stream.write_all(&data).await.map_err(|e| e.to_string())?;
+                stream.shutdown().await.map_err(|e| e.to_string())?;
+                let mut result = Vec::new(); stream.read_to_end(&mut result).await.map_err(|e| e.to_string())?;
+                if result != data { return Err("missing authenticated echo".into()); }
+                Ok::<_, String>(())
+            }.await;
+            let expected = !["bad-pin", "bad-name", "no-client-cert", "truncated-client-chain"].contains(&case);
+            assert_eq!(exchange.is_ok(), expected, "{case}: {exchange:?}");
+            peer.kill().await.unwrap(); peer.wait().await.unwrap();
+        }).await.unwrap_or_else(|_| panic!("H3 TLS identity {case} deadline"));
+    }
+}

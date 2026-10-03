@@ -369,6 +369,39 @@ pub(crate) fn build_root_store(
     Ok(builder)
 }
 
+/// Attach the full client chain and validate its private key once per context.
+pub(crate) fn apply_client_identity(
+    builder: &mut boring::ssl::SslContextBuilder,
+    config: &TlsConfig,
+) -> Result<()> {
+    let Some(identity) = &config.client_cert else {
+        return Ok(());
+    };
+    let chain = boring::x509::X509::stack_from_pem(&identity.cert_pem)
+        .map_err(|e| TransportError::Config(format!("client certificate PEM: {e}")))?;
+    let mut chain = chain.into_iter();
+    let leaf = chain
+        .next()
+        .ok_or_else(|| TransportError::Config("empty client certificate chain".into()))?;
+    let key = boring::pkey::PKey::private_key_from_pem(&identity.key_pem)
+        .map_err(|e| TransportError::Config(format!("client private key PEM: {e}")))?;
+    builder
+        .set_certificate(&leaf)
+        .map_err(|e| TransportError::Tls(format!("set client certificate: {e}")))?;
+    builder
+        .set_private_key(&key)
+        .map_err(|e| TransportError::Tls(format!("set client private key: {e}")))?;
+    for cert in chain {
+        builder
+            .add_extra_chain_cert(cert)
+            .map_err(|e| TransportError::Tls(format!("set client certificate chain: {e}")))?;
+    }
+    builder.check_private_key().map_err(|e| {
+        TransportError::Config(format!("client certificate/private key mismatch: {e}"))
+    })?;
+    Ok(())
+}
+
 /// Cache key for [`CONNECTOR_CACHE`] — the [`TlsConfig`] fields that shape
 /// the `SSL_CTX`.  SNI and ECH are per-connection (`ConnectConfiguration`),
 /// so they stay out of the key.
@@ -409,7 +442,7 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
         fingerprint: config.fingerprint.clone(),
         curves: config.curves.clone(),
         alpn: config.alpn.clone(),
-        skip_cert_verify: config.skip_cert_verify,
+        skip_cert_verify: config.skip_cert_verify && config.verify_name.is_none(),
     };
     let cache = CONNECTOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -432,7 +465,7 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
 /// `X509_VERIFY_PARAM` must see the unbracketed form to take the
 /// `set1_ip`/`iPAddress` SAN path instead of a doomed DNS-name compare.
 /// A non-IP bracketed string stays verbatim.
-pub(super) fn unbracket_ip_literal(name: &str) -> &str {
+pub(crate) fn unbracket_ip_literal(name: &str) -> &str {
     name.strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
@@ -583,7 +616,7 @@ impl BoringInner {
         }
 
         // ── Certificate verification ─────────────────────────────────────────
-        if config.skip_cert_verify {
+        if config.skip_cert_verify && config.verify_name.is_none() {
             // Warned about once per proxy in `TlsLayer::new`.
             b.set_verify(boring::ssl::SslVerifyMode::NONE);
         } else {
@@ -598,22 +631,7 @@ impl BoringInner {
         }
 
         // ── Client certificate (mTLS) ────────────────────────────────────────
-        if let Some(cc) = &config.client_cert {
-            let cert = boring::x509::X509::from_pem(&cc.cert_pem).map_err(|e| {
-                TransportError::Config(format!(
-                    "client_cert.cert_pem: PEM parse error (boring): {e}"
-                ))
-            })?;
-            let key = boring::pkey::PKey::private_key_from_pem(&cc.key_pem).map_err(|e| {
-                TransportError::Config(format!(
-                    "client_cert.key_pem: PEM parse error (boring): {e}"
-                ))
-            })?;
-            b.set_certificate(&cert)
-                .map_err(|e| TransportError::Tls(format!("boring: set_certificate: {e}")))?;
-            b.set_private_key(&key)
-                .map_err(|e| TransportError::Tls(format!("boring: set_private_key: {e}")))?;
-        }
+        apply_client_identity(&mut b, config)?;
 
         // BoringSSL defaults to SSL_SESS_CACHE_BOTH with unbounded size
         // (0 = unlimited) — every completed handshake stores an
@@ -900,7 +918,7 @@ impl LazyBoringInner {
 ///   hostname check (upstream `x509.VerifyOptions{Roots: {cert[i]},
 ///   Intermediates: certs[1..=i], DNSName: serverName}`).
 /// - **No match** → reject with `bad_certificate`.
-fn verify_cert_pin(
+pub(crate) fn verify_cert_pin(
     ssl: &mut boring::ssl::SslRef,
     pin: &[u8; 32],
     check_name: &str,
@@ -920,11 +938,8 @@ fn verify_cert_pin(
 /// as-pinned (upstream `FingerprintVerifier`'s `i == 0` arm — no name or
 /// chain check); a deeper pin runs [`verify_leaf_under_pinned_cert`].
 ///
-/// Divergence note: upstream composes `NewNameCertVerifier` *around* the
-/// fingerprint verifier, so a leaf-pin hit still runs `VerifyHostname`
-/// when `name-cert-verify` is set. Here a leaf pin is an identity check —
-/// the cert bytes themselves are the pinned identity — so no name check
-/// applies on that arm (meow accepts where upstream rejects).
+/// The pinned reference's leaf match replaces name/CA checks; name overrides
+/// select the verification name only when the pin matches a non-leaf cert.
 fn pinned_chain_decision(
     chain: &boring::stack::StackRef<boring::x509::X509>,
     pin: &[u8; 32],

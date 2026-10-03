@@ -182,7 +182,7 @@ pub(crate) fn verify_certificate_chain(
         ));
     }
 
-    if policy.skip_cert_verify {
+    if policy.skip_cert_verify && policy.verify_name.is_none() {
         return Ok(());
     }
 

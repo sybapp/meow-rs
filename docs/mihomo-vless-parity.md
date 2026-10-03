@@ -11,6 +11,7 @@ the whole meow kernel, or even every VLESS transport setting, equals mihomo.
 | Auto selection | Plain TLS/h2c/H3 chooses `packet-up`; REALITY chooses `stream-one` or `stream-up` with independent H2 download | H3 independent download selection |
 | Metadata | Path/query/header/cookie sessions and sequence numbers; configurable upload method | Reserved methods still depend on peer support (mihomo server treats GET as download) |
 | H2 endpoints | Independent server/port, TLS/SNI/fingerprint/ECH, trust name, certificate pin, mTLS; parent inheritance with null/empty-map semantics; app-protected dialer and probe flags | H3 or HTTP/1.1 endpoints; ShadowTLS/RESTLS/JLS security wiring; DNS-sourced download ECH |
+| H2/H3 TLS identity | Leaf/non-leaf certificate pins, independent SNI/name/IP verification, complete mTLS chains and key matching; explicit verification name overrides skip-cert-verify | H3 ECH; automatic identity-file rotation; full browser ClientHello profiles |
 | H2 reuse | Logical-tunnel limits, preferred transport width, concurrency overflow, requests/reuses/expiry, 300 s idle retirement; probe isolation, reset and GOAWAY preserve accepted streams; 45 s default heartbeat or signed keep-alive period | Other HTTP backends; same entry can remain eligible after expiry while active (matching pinned upstream) |
 | Packet upload | Finite requests, monotonic sequence, timer/size flushing, bounded serial acknowledgement, shutdown flush | H2 XMUX manager implemented; H3 XMUX and HTTP/1.1 request pool remain absent |
 | Payload | Body/auto, header and cookie; unpadded URL-safe Base64 chunking | Header/cookie packets use a conservative 8 KiB raw payload cap |
@@ -99,7 +100,7 @@ The peer can expose two separate H2 frontends over one upstream session handler;
 request captures validate endpoint routing without duplicating the Rust builder.
 The real config-to-VLESS adapter suite additionally decodes a synthetic VLESS TCP
 request and verifies shared user connections, isolated probes, SNI overrides,
-certificate pins and mutual TLS. A wrong pin fails before any HTTP request.
+certificate pins and mutual TLS on H2 and H3. Client fixtures contain an intermediate-backed chain; the server trusts only the root. H3 checks also reject wrong pins/names, absent identities and truncated client chains. Name verification remains enabled with an explicit override even when skip-cert-verify is true. A wrong pin fails before any HTTP request.
 
 ```sh
 MEOW_XHTTP_PEER_BIN=/tmp/mihomo-xhttp-peer cargo test -p meow-config \
@@ -116,5 +117,7 @@ this work does not add device, NetworkExtension, RSS/OOM or battery validation.
 HTTP/1.1, H3 reuse/download and mixed-version endpoints still need implementation.
 H2 reuse/download is integrated into the VLESS TCP/UDP and mux dial paths;
 configuration-to-adapter interop checks assert physical connection counts, SNI,
-pinning and mutual TLS against the independent peer. No previous uncommitted
+pinning and mutual TLS against the independent peer. H3 TLS identity support
+is covered through both the transport and actual VLESS adapter; H3 reuse and
+independent download remain outstanding. No previous uncommitted
 prototype is counted as implemented compatibility here.

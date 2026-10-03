@@ -42,8 +42,8 @@ async fn configured_endpoints(tls: bool) {
             proxy["tls"] = serde_yaml::Value::Bool(true);
             proxy["servername"] = serde_yaml::Value::String("upload.example".into());
             proxy["fingerprint"] = serde_yaml::Value::String(startup["fingerprint"].as_str().unwrap().into());
-            proxy["certificate"] = serde_yaml::Value::String(startup["certificate-pem"].as_str().unwrap().into());
-            proxy["private-key"] = serde_yaml::Value::String(startup["private-key-pem"].as_str().unwrap().into());
+            proxy["certificate"] = serde_yaml::Value::String(startup["client-certificate-pem"].as_str().unwrap().into());
+            proxy["private-key"] = serde_yaml::Value::String(startup["client-private-key-pem"].as_str().unwrap().into());
             proxy["xhttp-opts"]["download-settings"]["servername"] = serde_yaml::Value::String("download.example".into());
             let mut invalid = document.clone();
             invalid["proxies"][0]["fingerprint"] = serde_yaml::Value::String("00".repeat(32));
@@ -85,4 +85,30 @@ async fn configured_h2_reuse_download_endpoints_are_used_by_vless() {
 #[tokio::test]
 async fn configured_h2_download_tls_sni_pin_and_mutual_tls() {
     configured_endpoints(true).await;
+}
+
+#[tokio::test]
+async fn configured_h3_uses_pin_sni_and_complete_client_chain() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut peer = Command::new(std::env::var("MEOW_XHTTP_PEER_BIN").expect("independent peer required"))
+            .args(["-protocol", "h3", "-require-client-cert", "-vless", "-bytes", "8193", "-config", "{\"Host\":\"example.org\",\"Path\":\"/tls\",\"Mode\":\"auto\",\"XPaddingBytes\":\"16\"}"])
+            .stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+        let mut output = BufReader::new(peer.stdout.take().unwrap());
+        let mut startup = String::new(); output.read_line(&mut startup).await.unwrap();
+        let startup: serde_json::Value = serde_json::from_str(&startup).unwrap();
+        let addr: std::net::SocketAddr = startup["address"].as_str().unwrap().parse().unwrap();
+        let proxy = serde_json::json!({
+            "name": "h3", "type": "vless", "server": addr.ip().to_string(), "port": addr.port(),
+            "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "tls": true, "alpn": ["h3"], "network": "xhttp",
+            "servername": "different.example", "fingerprint": startup["fingerprint"],
+            "certificate": startup["client-certificate-pem"], "private-key": startup["client-private-key-pem"],
+            "xhttp-opts": {"path": "/tls", "host": "example.org", "mode": "stream-up", "x-padding-bytes": "16"}
+        });
+        let document = serde_json::json!({"proxies": [proxy]});
+        let config = load_config_from_str(&document.to_string()).await.unwrap();
+        let adapter = config.proxies.get("h3").expect("H3 TLS identity loads");
+        let conn = adapter.dial_tcp(&Metadata { host: "target.example".into(), dst_port: 443, ..Default::default() }).await.unwrap();
+        exchange(conn).await;
+        peer.kill().await.unwrap(); peer.wait().await.unwrap();
+    }).await.expect("configured H3 TLS identity deadline");
 }

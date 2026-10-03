@@ -217,7 +217,7 @@ async fn timed_out_handshake_releases_udp_association() {
 #[test]
 fn unsupported_tls_options_fail_before_dial() {
     let mut tls = TlsConfig::new("example.org");
-    tls.cert_pin = Some([0; 32]);
+    tls.ech = Some(meow_transport::tls::EchOpts::Config(Vec::new()));
     assert!(Xhttp3Client::new(XhttpConfig::default(), &tls).is_err());
 }
 

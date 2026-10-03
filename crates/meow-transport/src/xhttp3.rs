@@ -34,6 +34,8 @@ pub trait Datagram: Send + Sync {
 pub struct Xhttp3Client {
     config: XhttpConfig,
     sni: String,
+    verify_name: Option<String>,
+    cert_pin: Option<[u8; 32]>,
     quic: Mutex<quiche::Config>,
 }
 
@@ -46,7 +48,15 @@ impl Xhttp3Client {
         let quic = crate::tls::xhttp3_config(tls)?;
         Ok(Self {
             config,
-            sni: tls.sni.clone().expect("validated"),
+            sni: crate::tls::boring_backend::unbracket_ip_literal(
+                tls.sni.as_deref().expect("validated"),
+            )
+            .into(),
+            verify_name: tls
+                .verify_name
+                .as_deref()
+                .map(|s| crate::tls::boring_backend::unbracket_ip_literal(s).into()),
+            cert_pin: tls.cert_pin,
             quic: Mutex::new(quic),
         })
     }
@@ -96,14 +106,37 @@ impl Xhttp3Client {
             None
         };
         let scid = rand::random::<[u8; quiche::MAX_CONN_ID_LEN]>();
-        let conn = quiche::connect(
-            Some(&self.sni),
+        // Install SNI and verification independently below: quiche's
+        // hostname helper seeds both fields with one name, preventing clean
+        // name/IP overrides on BoringSSL.
+        let mut conn = quiche::connect(
+            None,
             &quiche::ConnectionId::from_ref(&scid),
             local,
             peer,
             &mut self.quic.lock().expect("QUIC config lock"),
         )
         .map_err(|e| TransportError::Xhttp(e.to_string()))?;
+        let ssl: &mut boring::ssl::SslRef = conn.as_mut();
+        if self.sni.parse::<std::net::IpAddr>().is_err() {
+            ssl.set_hostname(&self.sni)
+                .map_err(|e| TransportError::Tls(format!("QUIC SNI: {e}")))?;
+        }
+        if let Some(pin) = self.cert_pin {
+            let name = self.verify_name.clone().unwrap_or_else(|| self.sni.clone());
+            ssl.set_custom_verify_callback(boring::ssl::SslVerifyMode::PEER, move |ssl| {
+                crate::tls::boring_backend::verify_cert_pin(ssl, &pin, &name)
+            });
+        } else {
+            let name = self.verify_name.as_deref().unwrap_or(&self.sni);
+            let param = ssl.param_mut();
+            param.set_hostflags(boring::x509::verify::X509CheckFlags::NO_PARTIAL_WILDCARDS);
+            match name.parse::<std::net::IpAddr>() {
+                Ok(ip) => param.set_ip(ip),
+                Err(_) => param.set_host(name),
+            }
+            .map_err(|e| TransportError::Tls(format!("QUIC verify name: {e}")))?;
+        }
         let (app, pump) = tokio::io::duplex(BUFFER);
         let error = Arc::new(Mutex::new(None));
         let driver_error = Arc::clone(&error);
@@ -360,6 +393,29 @@ async fn drive(
                         upload_fin = false;
                     }
                     Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {}
+                    // A peer may finish its successful response and cancel
+                    // further request input after consuming the final DATA,
+                    // before this driver observes the application's EOF. An
+                    // empty FIN then targets a stopped/collected stream. Do
+                    // not turn the complete response into a read error; a
+                    // pending payload write still propagates every failure.
+                    Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(0x10c))) => {
+                        // STOP_SENDING may arrive before the HTTP response
+                        // headers; their status/deadline is still enforced.
+                        upload_fin = false;
+                    }
+                    Err(quiche::h3::Error::TransportError(quiche::Error::InvalidStreamState(
+                        id,
+                    ))) if id == upload
+                        && conn.stream_finished(upload)
+                        && if split {
+                            got_upload_headers
+                        } else {
+                            got_download_headers
+                        } =>
+                    {
+                        upload_fin = false;
+                    }
                     Err(e) => return Err(quic_io(e)),
                 }
             }
