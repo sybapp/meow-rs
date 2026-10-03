@@ -72,6 +72,7 @@ dashmap = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
@@ -82,3 +83,7 @@ path = "tests/vless_config_test.rs"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "vless_xhttp_endpoint_interop"
+required-features = ["vless"]

@@ -313,17 +313,36 @@ jobs:
           cargo nextest run -p meow-proxy --features anytls --lib \
             --test anytls_integration --test anytls_leak --retries 2 --no-fail-fast
 
+      - name: Set up Go (mihomo XHTTP interoperability peer)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/mihomo-xhttp-peer/go.mod
+          cache: false
+
+      - name: Build pinned mihomo XHTTP interoperability peer
+        working-directory: crates/meow-transport/tests/support/mihomo-xhttp-peer
+        run: go build -o "${{ runner.temp }}/mihomo-xhttp-peer" .
+
       # One invocation/feature set for the feature-gated transport suites.
       # Per-feature-combination *compile* coverage (the old G1-G6 matrix)
       # lives in the feature-powerset job; the nightly coverage workflow
       # runs these same tests under --all-features.
-      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP)
+      - name: Transport feature-gated tests (gRPC / H2 / HTTPUpgrade / XHTTP H2/H3)
+        env:
+          MEOW_XHTTP_PEER_BIN: ${{ runner.temp }}/mihomo-xhttp-peer
         run: |
-          cargo nextest run -p meow-transport --features "grpc,h2,httpupgrade,xhttp" \
+          cargo nextest run -p meow-transport --features "grpc,h2,httpupgrade,xhttp3" \
             --test grpc_test \
             --test h2_test \
             --test xhttp_test \
+            --test xhttp3_test \
+            --test xhttp_mihomo_interop \
             --test httpupgrade_test --retries 2 --no-fail-fast
+
+      - name: VLESS XHTTP parser and reusable endpoint interop
+        env:
+          MEOW_XHTTP_PEER_BIN: ${{ runner.temp }}/mihomo-xhttp-peer
+        run: cargo nextest run -p meow-config --test vless_xhttp_endpoint_interop --no-fail-fast
 
   features:
     runs-on: ubuntu-latest

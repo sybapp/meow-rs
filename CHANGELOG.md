@@ -9,6 +9,8 @@ the canonical, in-repo source a release is cut from.
 ## [Unreleased]
 
 ### Added
+- VLESS XHTTP H2/h2c and H3 modes, configurable wire metadata/padding, H2 reuse and independent download endpoints, protected QUIC dialing, and H2/H3 TLS identity verification. See [XHTTP compatibility](docs/xhttp.md).
+
 
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
   file-descriptor soft limit toward the hard limit (≤ 65536) before any
@@ -437,6 +439,9 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
+
+- Clear inherited obfs/KCP/subscription Clippy warnings without behavior changes.
+
 
 - **`meow -t` and startup now reject inbounds the binary did not
   compile.** A `listeners:` entry such as `type: shadowsocks` without

@@ -16,6 +16,397 @@ use support::loopback::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn stream_one_config() -> XhttpConfig {
+    XhttpConfig {
+        mode: "stream-one".into(),
+        ..Default::default()
+    }
+}
+
+type CapturedSplitRequests = (http::Request<()>, http::Request<()>);
+
+// Test-only split peer. Keep polling the connection separately from the body
+// worker, and deliberately withhold GET headers until the first POST DATA.
+async fn split_peer(
+    config: XhttpConfig,
+    download_status: u16,
+    upload_status: u16,
+) -> (
+    Box<dyn meow_transport::Stream>,
+    tokio::sync::oneshot::Receiver<CapturedSplitRequests>,
+    tokio::sync::oneshot::Receiver<Vec<u8>>,
+) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut connection = h2::server::handshake(server)
+            .await
+            .expect("server handshake");
+        let (download, mut download_response) = connection
+            .accept()
+            .await
+            .expect("GET")
+            .expect("GET request");
+        let (upload, mut upload_response) = connection
+            .accept()
+            .await
+            .expect("POST")
+            .expect("POST request");
+        let (upload_parts, mut body) = upload.into_parts();
+        requests_tx
+            .send((
+                download.map(|_| ()),
+                http::Request::from_parts(upload_parts, ()),
+            ))
+            .expect("capture requests");
+        tokio::spawn(async move {
+            if upload_status >= 300 {
+                upload_response
+                    .send_response(
+                        http::Response::builder()
+                            .status(upload_status)
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .expect("upload error response");
+            }
+            let first = body.data().await.transpose().expect("first upload DATA");
+            let mut send = download_response
+                .send_response(
+                    http::Response::builder()
+                        .status(download_status)
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .expect("download response");
+            let mut received = Vec::new();
+            if let Some(bytes) = first {
+                body.flow_control().release_capacity(bytes.len()).unwrap();
+                received.extend_from_slice(&bytes);
+                if download_status == 200 {
+                    send.send_data(bytes, false).expect("first echo");
+                }
+            }
+            while let Some(item) = body.data().await {
+                let Ok(bytes) = item else {
+                    return;
+                };
+                body.flow_control().release_capacity(bytes.len()).unwrap();
+                received.extend_from_slice(&bytes);
+                if download_status == 200 {
+                    send.send_data(bytes, false).expect("echo");
+                }
+            }
+            send.send_data(bytes::Bytes::new(), true)
+                .expect("download EOF");
+            if upload_status < 300 {
+                upload_response
+                    .send_response(
+                        http::Response::builder()
+                            .status(upload_status)
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .expect("upload acknowledgement");
+            }
+            let _ = body_tx.send(received);
+        });
+        while connection.accept().await.is_some() {}
+    });
+    let stream = XhttpLayer::new(config)
+        .connect(Box::new(client))
+        .await
+        .expect("split connect without response headers");
+    (stream, requests_rx, body_rx)
+}
+
+fn split_config() -> XhttpConfig {
+    XhttpConfig {
+        mode: "stream-up".into(),
+        path: "/api/v1/telemetry?ed=1".into(),
+        hosts: vec!["example.org".into()],
+        session_placement: "header".into(),
+        session_key: "X-Session-Id".into(),
+        session_table: "Base62".into(),
+        session_length: (16, 24),
+        x_padding_obfs_mode: true,
+        x_padding_method: "tokenish".into(),
+        x_padding_placement: "header".into(),
+        x_padding_header: "X-Cache-Key".into(),
+        x_padding_bytes: Some((128, 512)),
+        no_grpc_header: true,
+        ..stream_one_config()
+    }
+}
+
+#[tokio::test]
+async fn stream_up_header_session_deferred_response_round_trip() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (stream, requests, body) = split_peer(split_config(), 200, 204).await;
+        let (get, post) = requests.await.expect("captured requests");
+        assert_eq!(get.method(), "GET");
+        assert_eq!(post.method(), "POST");
+        for request in [&get, &post] {
+            assert_eq!(
+                request.uri().path_and_query().unwrap().as_str(),
+                "/api/v1/telemetry%3Fed=1/"
+            );
+            assert_eq!(request.uri().host(), Some("example.org"));
+            assert!(!request.headers().contains_key("content-type"));
+            assert!(!request.headers().contains_key("referer"));
+            let padding = request.headers()["X-Cache-Key"].as_bytes();
+            assert!(padding.len() >= 128 && padding.len() <= 820);
+            assert!(padding.iter().all(u8::is_ascii_alphanumeric));
+        }
+        let session = get.headers()["X-Session-Id"].as_bytes();
+        assert_eq!(
+            get.headers()["X-Session-Id"],
+            post.headers()["X-Session-Id"]
+        );
+        assert!((16..=24).contains(&session.len()));
+        assert!(session.iter().all(u8::is_ascii_alphanumeric));
+        let payload: Vec<u8> = (0..=255).cycle().take(1024 * 1024).collect();
+        let (mut read, mut write) = tokio::io::split(stream);
+        let sending = async {
+            write.write_all(&payload).await.expect("upload");
+            write.shutdown().await.expect("upload EOF");
+        };
+        let receiving = async {
+            let mut echoed = Vec::new();
+            read.read_to_end(&mut echoed).await.expect("download");
+            assert_eq!(echoed, payload);
+        };
+        tokio::join!(sending, receiving);
+        assert_eq!(body.await.expect("complete upload body"), payload);
+    })
+    .await
+    .expect("split transport must not deadlock");
+}
+
+#[tokio::test]
+async fn stream_up_default_path_session_and_drop_deliver_eof() {
+    let config = XhttpConfig {
+        mode: "stream-up".into(),
+        path: "/split?key=value".into(),
+        x_padding_bytes: None,
+        ..stream_one_config()
+    };
+    let (mut stream, requests, body) = split_peer(config, 200, 200).await;
+    let (get, post) = requests.await.unwrap();
+    assert_eq!(get.uri(), post.uri());
+    let session = get
+        .uri()
+        .path()
+        .strip_prefix("/split%3Fkey=value/")
+        .expect("session in path");
+    assert_eq!(session.len(), 32);
+    assert!(session.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(get.uri().query(), None);
+    assert!(!get.headers().contains_key("content-type"));
+    assert_eq!(post.headers()["content-type"], "application/grpc");
+    stream
+        .write_all(b"queued upload before drop")
+        .await
+        .unwrap();
+    drop(stream);
+    let received = tokio::time::timeout(Duration::from_secs(3), body)
+        .await
+        .expect("drop must flush EOF")
+        .expect("upload completes without reset");
+    assert_eq!(received, b"queued upload before drop");
+}
+
+#[tokio::test]
+async fn stream_up_query_in_header_padding_precedes_path_session() {
+    let config = XhttpConfig {
+        mode: "stream-up".into(),
+        path: "/split?original=query".into(),
+        hosts: vec!["example.org".into()],
+        x_padding_obfs_mode: true,
+        x_padding_placement: "queryInHeader".into(),
+        x_padding_header: "X-Padding-Url".into(),
+        x_padding_key: "pad".into(),
+        x_padding_bytes: Some((32, 32)),
+        ..stream_one_config()
+    };
+    let (stream, requests, _) = split_peer(config, 200, 204).await;
+    let (get, post) = requests.await.unwrap();
+    assert_eq!(get.uri(), post.uri());
+    assert_eq!(get.uri().query(), None);
+    for request in [&get, &post] {
+        assert_eq!(
+            request.headers()["X-Padding-Url"].to_str().unwrap(),
+            format!(
+                "https://example.org/split%3Foriginal=query/?pad={}",
+                "X".repeat(32)
+            )
+        );
+        assert!(!request.headers().contains_key("referer"));
+    }
+    drop(stream);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_up_upload_headers_can_wait_until_eof() {
+    let (mut stream, requests, body) = split_peer(split_config(), 200, 204).await;
+    requests.await.unwrap();
+    stream.write_all(b"a").await.unwrap();
+    let mut echoed = [0; 1];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"a");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    stream
+        .write_all(b"b")
+        .await
+        .expect("pending upload acknowledgement has no premature timeout");
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"b");
+    stream.shutdown().await.unwrap();
+    assert_eq!(body.await.unwrap(), b"ab");
+}
+
+#[tokio::test]
+async fn stream_up_drop_releases_a_peer_that_never_replies() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut connection = h2::server::handshake(server).await.unwrap();
+        let download = connection.accept().await.unwrap().unwrap();
+        let upload = connection.accept().await.unwrap().unwrap();
+        opened_tx.send(()).unwrap();
+        // Retain both bodies and response handles to simulate a wedged peer.
+        while connection.accept().await.is_some() {}
+        drop((download, upload));
+        closed_tx.send(()).unwrap();
+    });
+    let stream = XhttpLayer::new(split_config())
+        .connect(Box::new(client))
+        .await
+        .unwrap();
+    opened_rx.await.unwrap();
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(3), closed_rx)
+        .await
+        .expect("driver drain must be bounded")
+        .expect("peer sees closed socket");
+}
+
+#[tokio::test]
+async fn stream_up_rejects_bad_status_on_either_leg() {
+    for (download_status, upload_status) in [(201, 204), (200, 403)] {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (mut stream, requests, _) =
+                split_peer(split_config(), download_status, upload_status).await;
+            let _ = requests.await.unwrap();
+            // An upload rejection can already be visible before the first write.
+            if stream.write_all(b"first byte").await.is_ok() {
+                let mut buffer = [0; 1];
+                let error = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect_err("bad HTTP status must fail");
+                assert!(error.to_string().contains("status"), "{error}");
+            }
+        })
+        .await
+        .expect("bad status must fail promptly");
+    }
+}
+
+// A finite packet peer: it reads the complete upload before acknowledging it,
+// and holds the download open so shutdown must observe the upload result.
+async fn packet_ack_peer(
+    status: Option<u16>,
+) -> (
+    Box<dyn meow_transport::Stream>,
+    tokio::sync::oneshot::Receiver<Vec<u8>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut connection = h2::server::handshake(server).await.unwrap();
+        let (_, mut download) = connection.accept().await.unwrap().unwrap();
+        let download = download
+            .send_response(http::Response::new(()), false)
+            .unwrap();
+        let (upload, mut response) = connection.accept().await.unwrap().unwrap();
+        let worker = tokio::spawn(async move {
+            let mut body = upload.into_body();
+            let mut received = Vec::new();
+            while let Some(bytes) = body.data().await {
+                let bytes = bytes.unwrap();
+                body.flow_control().release_capacity(bytes.len()).unwrap();
+                received.extend_from_slice(&bytes);
+            }
+            body_tx.send(received).unwrap();
+            if let Some(status) = status {
+                response
+                    .send_response(
+                        http::Response::builder().status(status).body(()).unwrap(),
+                        true,
+                    )
+                    .unwrap();
+            } else {
+                // Keep the response handle alive until the client closes.
+                std::future::pending::<()>().await;
+            }
+        });
+        while connection.accept().await.is_some() {}
+        worker.abort();
+        drop(download);
+        let _ = closed_tx.send(());
+    });
+    let config = XhttpConfig {
+        mode: "packet-up".into(),
+        sc_max_each_post_bytes: (1024, 1024),
+        sc_min_posts_interval_ms: (30, 30),
+        ..Default::default()
+    };
+    let stream = XhttpLayer::new(config)
+        .connect(Box::new(client))
+        .await
+        .unwrap();
+    (stream, body_rx, closed_rx)
+}
+
+#[tokio::test]
+async fn packet_up_shutdown_flushes_and_rejects_bad_acknowledgement() {
+    for status in [201, 403] {
+        let (mut stream, body, closed) = packet_ack_peer(Some(status)).await;
+        stream.write_all(b"last partial packet").await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), stream.shutdown())
+            .await
+            .expect("bad acknowledgement must fail promptly")
+            .expect_err("shutdown must not hide upload rejection");
+        assert!(error.to_string().contains(&status.to_string()), "{error}");
+        assert_eq!(body.await.unwrap(), b"last partial packet");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(3), closed)
+            .await
+            .expect("failed packet worker must release the connection")
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_up_shutdown_times_out_a_missing_acknowledgement() {
+    let (mut stream, body, closed) = packet_ack_peer(None).await;
+    stream.write_all(b"last partial packet").await.unwrap();
+    let shutdown = tokio::spawn(async move { stream.shutdown().await });
+    assert_eq!(body.await.unwrap(), b"last partial packet");
+    tokio::time::advance(Duration::from_secs(16)).await;
+    let error = shutdown.await.unwrap().expect_err("bounded upload wait");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    closed.await.unwrap();
+}
+
 async fn assert_xhttp_config_error(case: &str, config: XhttpConfig, expected: &str) {
     let (client, server) = tokio::io::duplex(64);
     drop(server);
@@ -49,14 +440,14 @@ async fn xhttp_round_trip_1mib() {
         path: "/xhttp-test?ed=1".into(),
         hosts: vec!["example.com".into()],
         x_padding_bytes: Some((128, 128)),
-        ..Default::default()
+        ..stream_one_config()
     });
     let stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
 
     let req_info = rx.recv().await.expect("server received request info");
     assert_eq!(req_info.method, "POST");
     assert_eq!(req_info.scheme.as_deref(), Some("https"));
-    assert_eq!(req_info.path_and_query, "/xhttp-test/?ed=1");
+    assert_eq!(req_info.path_and_query, "/xhttp-test%3Fed=1/");
     assert_eq!(req_info.authority.as_deref(), Some("example.com"));
     assert_eq!(
         req_info
@@ -71,7 +462,7 @@ async fn xhttp_round_trip_1mib() {
         .and_then(|v| v.to_str().ok())
         .expect("default padding Referer");
     let padding = referer
-        .strip_prefix("https://example.com/xhttp-test/?x_padding=")
+        .strip_prefix("https://example.com/xhttp-test%3Fed=1/?x_padding=")
         .expect("Referer must replace the original query with x_padding");
     assert_eq!(padding.len(), 128);
     assert!(padding.bytes().all(|b| b == b'X'));
@@ -120,7 +511,7 @@ async fn xhttp_host_selection_is_uniform() {
             "c.com".into(),
             "d.com".into(),
         ],
-        ..Default::default()
+        ..stream_one_config()
     });
 
     let mut seen = HashSet::new();
@@ -163,7 +554,7 @@ async fn xhttp_headers_and_no_grpc_header() {
         extra_headers: vec![("x-custom-test".into(), "val123".into())],
         no_grpc_header: true,
         x_padding_bytes: None,
-        ..Default::default()
+        ..stream_one_config()
     });
 
     let stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
@@ -198,7 +589,7 @@ async fn xhttp_round_trip_with_deferred_response() {
     let layer = XhttpLayer::new(XhttpConfig {
         path: "/deferred".into(),
         hosts: vec!["deferred.host".into()],
-        ..Default::default()
+        ..stream_one_config()
     });
 
     // connect() must return immediately without waiting for server response
@@ -223,7 +614,7 @@ async fn xhttp_drop_sends_clean_eos() {
         .await
         .expect("tcp connect");
 
-    let layer = XhttpLayer::new(XhttpConfig::default());
+    let layer = XhttpLayer::new(stream_one_config());
     let mut stream = layer.connect(Box::new(tcp)).await.expect("xhttp connect");
 
     stream
@@ -247,7 +638,7 @@ async fn xhttp_config_validation() {
         "empty_hosts",
         XhttpConfig {
             hosts: vec![],
-            ..Default::default()
+            ..stream_one_config()
         },
         "hosts must not be empty",
     )
@@ -256,18 +647,18 @@ async fn xhttp_config_validation() {
     assert_xhttp_config_error(
         "invalid_path",
         XhttpConfig {
-            path: "relative".into(),
-            ..Default::default()
+            path: "/with\ncontrol".into(),
+            ..stream_one_config()
         },
-        "path must start with '/'",
+        "path contains whitespace",
     )
     .await;
 
     assert_xhttp_config_error(
         "invalid_mode",
         XhttpConfig {
-            mode: "packet-up".into(),
-            ..Default::default()
+            mode: "unknown".into(),
+            ..stream_one_config()
         },
         "unsupported mode",
     )
@@ -277,7 +668,7 @@ async fn xhttp_config_validation() {
         "invalid_padding",
         XhttpConfig {
             x_padding_bytes: Some((500, 100)),
-            ..Default::default()
+            ..stream_one_config()
         },
         "min (500) cannot exceed max (100)",
     )
@@ -300,7 +691,7 @@ async fn xhttp_drop_bounds_stalled_driver_lifetime() {
         assert!(bytes.starts_with(b"PRI * HTTP/2.0"));
     });
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let stream = XhttpLayer::new(XhttpConfig::default())
+    let stream = XhttpLayer::new(stream_one_config())
         .connect(Box::new(tcp))
         .await
         .expect("lazy XHTTP connect");
@@ -327,7 +718,7 @@ async fn xhttp_receive_window_absorbs_1mib_before_first_read() {
     let layer = XhttpLayer::new(XhttpConfig {
         path: "/".into(),
         hosts: vec!["example.com".into()],
-        ..Default::default()
+        ..stream_one_config()
     });
     let mut stream = layer
         .connect(Box::new(client_io))

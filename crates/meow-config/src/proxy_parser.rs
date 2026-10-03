@@ -1,3 +1,5 @@
+#[cfg(feature = "vless")]
+mod xhttp;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
@@ -16,6 +18,11 @@ use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "vless")]
+use xhttp::{
+    apply_vless_tls_identity, build_xhttp_h2_endpoint, parse_xhttp_download_settings,
+    parse_xhttp_download_tls, reject_xhttp3_connection_options,
+};
 
 fn required_port(
     config: &HashMap<String, serde_yaml::Value>,
@@ -1488,6 +1495,19 @@ fn parse_vless(
         .unwrap_or("tcp");
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
+    // Upstream selects H3/H1 only for an exact singleton ALPN; every other
+    // configured list uses the H2 backend and forces h2 in the TLS handshake.
+    let use_h3 = network == "xhttp" && alpn == ["h3"];
+    if use_h3 && !tls {
+        return Err("vless: XHTTP/3 requires tls: true".into());
+    }
+    if network == "xhttp" && alpn == ["http/1.1"] {
+        return Err("vless: XHTTP HTTP/1.1 backend is not implemented".into());
+    }
+    let mut h3_client = None;
+    let mut xhttp_client = None;
+    let mut xhttp_tls = None;
+
     // ── Reality opts ──────────────────────────────────────────────────────
     let reality = parse_vless_reality_opts(name, config)?;
     if reality.is_some() {
@@ -1515,8 +1535,7 @@ fn parse_vless(
 
     // ── client-fingerprint ──────────────────────────────────────────────
     // Passed through to TlsConfig.fingerprint; the TLS layer selects the
-    // BoringSSL backend when the `boring-tls` feature is compiled in,
-    // otherwise falls back to rustls with a stub warning.
+    // BoringSSL backend for ordinary TLS and the native REALITY record layer.
 
     // ── Flow parsing ──────────────────────────────────────────────────────
     let flow_str = config.get("flow").and_then(|v| v.as_str()).unwrap_or("");
@@ -1631,9 +1650,14 @@ fn parse_vless(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        tls_cfg.alpn = default_transport_alpn(network, alpn);
+        tls_cfg.alpn = if network == "xhttp" && !use_h3 {
+            vec!["h2".into()]
+        } else {
+            default_transport_alpn(network, alpn)
+        };
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         tls_cfg.reality = reality;
+        apply_vless_tls_identity(config, &mut tls_cfg)?;
 
         // ── ECH opts ────────────────────────────────────────────────────
         // DNS-sourced ECH (`enable: true` without `config:`) is resolved by
@@ -1659,9 +1683,21 @@ fn parse_vless(
             }
         }
 
-        let tls_layer =
-            TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
-        chain.push(Box::new(tls_layer));
+        if network == "xhttp" {
+            xhttp_tls = Some(tls_cfg.clone());
+        }
+        if use_h3 {
+            reject_xhttp3_connection_options(config)?;
+            let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+            h3_client = Some(
+                meow_transport::xhttp3::Xhttp3Client::new(xhttp_cfg, &tls_cfg)
+                    .map_err(|e| format!("vless: HTTP/3 layer error: {e}"))?,
+            );
+        } else {
+            let tls_layer =
+                TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
+            chain.push(Box::new(tls_layer));
+        }
     }
 
     match network {
@@ -1804,8 +1840,35 @@ fn parse_vless(
             chain.push(Box::new(HttpUpgradeLayer::new(hu_cfg)));
         }
         "xhttp" => {
-            let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
-            chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
+            if !use_h3 {
+                let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+                let upload =
+                    build_xhttp_h2_endpoint(config, xhttp_cfg.clone(), xhttp_tls.as_ref(), dialer)?;
+                let download = parse_xhttp_download_settings(config)?
+                    .map(|download| {
+                        let host = download
+                            .get("server")
+                            .and_then(serde_yaml::Value::as_str)
+                            .ok_or("vless: download server must be a string")?;
+                        let sni = download
+                            .get("servername")
+                            .and_then(serde_yaml::Value::as_str)
+                            .unwrap_or(host);
+                        let tls = download
+                            .get("tls")
+                            .and_then(serde_yaml::Value::as_bool)
+                            .unwrap_or(false);
+                        let down_cfg = parse_vless_xhttp_config(&download, host, sni, tls)?;
+                        let tls_cfg = parse_xhttp_download_tls(name, &download, host, sni, tls)?;
+                        build_xhttp_h2_endpoint(&download, down_cfg, tls_cfg.as_ref(), dialer)
+                    })
+                    .transpose()?;
+                xhttp_client = Some(
+                    meow_transport::xhttp::XhttpClient::new(upload, download)
+                        .map_err(|e| format!("vless: {e}"))?,
+                );
+                chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
+            }
         }
         other => {
             return Err(format!(
@@ -1825,6 +1888,20 @@ fn parse_vless(
         chain,
         Arc::clone(dialer),
     );
+    if let Some(client) = xhttp_client {
+        let relay_supported = config
+            .get("xhttp-opts")
+            .and_then(|o| o.get("download-settings"))
+            .is_none_or(serde_yaml::Value::is_null);
+        adapter = adapter
+            .with_xhttp(client, relay_supported)
+            .map_err(|e| format!("vless: {e}"))?;
+    }
+    if let Some(client) = h3_client {
+        adapter = adapter
+            .with_xhttp3(client)
+            .map_err(|e| format!("vless: {e}"))?;
+    }
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
 
@@ -2085,11 +2162,27 @@ fn parse_vless_xhttp_config(
     use meow_transport::xhttp::{XhttpConfig, MAX_EXTRA_HEADERS, MAX_X_PADDING_BYTES};
 
     let xhttp_opts = config.get("xhttp-opts");
-    let path = xhttp_opts
-        .and_then(|o| o.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
+    if xhttp_opts.is_some_and(|opts| !opts.is_mapping()) {
+        return Err("vless: xhttp-opts must be a mapping".into());
+    }
+    let string_option = |key: &str, default: &str| -> std::result::Result<String, String> {
+        match xhttp_opts.and_then(|opts| opts.get(key)) {
+            None => Ok(default.to_string()),
+            Some(value) => value
+                .as_str()
+                .map(std::string::ToString::to_string)
+                .ok_or_else(|| format!("vless: xhttp-opts.{key} must be a string")),
+        }
+    };
+    let bool_option = |key: &str, default: bool| -> std::result::Result<bool, String> {
+        match xhttp_opts.and_then(|opts| opts.get(key)) {
+            None => Ok(default),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("vless: xhttp-opts.{key} must be a boolean")),
+        }
+    };
+    let path = string_option("path", "/")?;
     let fallback_host = if servername.is_empty() {
         server
     } else {
@@ -2098,7 +2191,11 @@ fn parse_vless_xhttp_config(
     let hosts: Vec<String> = match xhttp_opts.and_then(|o| o.get("host")) {
         None => vec![fallback_host.to_string()],
         Some(value) if value.is_string() => {
-            vec![value.as_str().expect("checked string").to_string()]
+            vec![match value.as_str().expect("checked string") {
+                "" => fallback_host,
+                s => s,
+            }
+            .to_string()]
         }
         Some(value) if value.is_sequence() => value
             .as_sequence()
@@ -2117,100 +2214,78 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    let mode = xhttp_opts
-        .and_then(|o| o.get("mode"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("stream-one")
-        .to_string();
-    if !mode.eq_ignore_ascii_case("stream-one") {
-        return Err(format!(
-            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
-        ));
-    }
-    let extra_headers: Vec<(String, String)> = match xhttp_opts
-        .and_then(|o| o.get("headers"))
-        .and_then(|h| h.as_mapping())
-    {
-        Some(m) => {
-            // Bound remotely-supplied header lists — the padding cap below
-            // covers the worst case, but a giant `headers` map is still
-            // attacker-chosen process memory (issue #648).
-            if m.len() > MAX_EXTRA_HEADERS {
-                return Err(format!(
-                    "vless: xhttp-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
-                    m.len()
-                ));
-            }
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str()?.to_string();
-                    let val = v.as_str()?.to_string();
-                    Some((key, val))
-                })
-                .collect()
-        }
+    let mode = string_option("mode", "auto")?;
+    let extra_headers = match xhttp_opts.and_then(|opts| opts.get("headers")) {
         None => Vec::new(),
-    };
-    let no_grpc_header = xhttp_opts
-        .and_then(|o| o.get("no-grpc-header"))
-        .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false);
-    let x_padding_bytes =
-        if let Some(padding_val) = xhttp_opts.and_then(|o| o.get("x-padding-bytes")) {
-            if let Some(s) = padding_val.as_str() {
-                let parts: Vec<&str> = s.split('-').collect();
-                if parts.len() != 2 {
-                    return Err(format!(
-                        "vless: invalid x-padding-bytes range '{s}', expected 'min-max'"
-                    ));
-                }
-                let min = parts[0]
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("vless: invalid min in x-padding-bytes '{s}': {e}"))?;
-                let max = parts[1]
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("vless: invalid max in x-padding-bytes '{s}': {e}"))?;
-                if min > max {
-                    return Err(format!(
-                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                    ));
-                }
-                Some((min, max))
-            } else if let Some(seq) = padding_val.as_sequence() {
-                if seq.len() != 2 {
-                    return Err("vless: x-padding-bytes array must have 2 elements".into());
-                }
-                // `try_from`, not `as usize` — on 32-bit targets a u64 that
-                // exceeds usize::MAX would wrap under the cap check.
-                let min = usize::try_from(
-                    seq[0]
-                        .as_u64()
-                        .ok_or_else(|| "vless: invalid min in x-padding-bytes".to_string())?,
-                )
-                .map_err(|_| "vless: x-padding-bytes min out of range".to_string())?;
-                let max = usize::try_from(
-                    seq[1]
-                        .as_u64()
-                        .ok_or_else(|| "vless: invalid max in x-padding-bytes".to_string())?,
-                )
-                .map_err(|_| "vless: x-padding-bytes max out of range".to_string())?;
-                if min > max {
-                    return Err(format!(
-                        "vless: x-padding-bytes min ({min}) exceeds max ({max})"
-                    ));
-                }
-                Some((min, max))
-            } else {
-                return Err(
-                    "vless: x-padding-bytes must be a 'min-max' string or 2-element integer array"
-                        .to_string(),
-                );
+        Some(value) => {
+            let mapping = value
+                .as_mapping()
+                .ok_or("vless: xhttp-opts.headers must be a mapping")?;
+            if mapping.len() > MAX_EXTRA_HEADERS {
+                return Err("vless: too many XHTTP headers".into());
             }
-        } else {
-            Some((100, 1000))
+            mapping
+                .iter()
+                .map(|(key, value)| {
+                    let key = key
+                        .as_str()
+                        .ok_or("vless: XHTTP header names must be strings")?;
+                    let value = value
+                        .as_str()
+                        .ok_or("vless: XHTTP header values must be strings")?;
+                    Ok((key.to_string(), value.to_string()))
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?
+        }
+    };
+    let range_option =
+        |key: &str, default: (usize, usize)| -> std::result::Result<(usize, usize), String> {
+            let value = xhttp_opts.and_then(|opts| opts.get(key));
+            let Some(value) = value else {
+                return Ok(default);
+            };
+            if let Some(text) = value.as_str() {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Ok(default);
+                }
+                let (min, max) = text.split_once('-').unwrap_or((text, text));
+                let min = min
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("vless: invalid {key} min"))?;
+                let max = max
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("vless: invalid {key} max"))?;
+                if min > max {
+                    return Err(format!("vless: {key} min exceeds max"));
+                }
+                return Ok((min, max));
+            }
+            if let Some(array) = value.as_sequence() {
+                if array.len() != 2 {
+                    return Err(format!("vless: {key} array must have 2 elements"));
+                }
+                let integer = |value: &serde_yaml::Value| {
+                    value
+                        .as_u64()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .ok_or_else(|| format!("vless: invalid {key} integer"))
+                };
+                let min = integer(&array[0])?;
+                let max = integer(&array[1])?;
+                if min > max {
+                    return Err(format!("vless: {key} min exceeds max"));
+                }
+                return Ok((min, max));
+            }
+            Err(format!(
+                "vless: {key} must be a range string or 2-element integer array"
+            ))
         };
+    let no_grpc_header = bool_option("no-grpc-header", false)?;
+    let x_padding_bytes = Some(range_option("x-padding-bytes", (100, 1000))?);
     // The padding becomes a `String` of `pad_len` bytes on every connect —
     // unbounded, a provider/subscription node could abort the process via a
     // remote health check or any routed dial (issue #648).
@@ -2222,15 +2297,56 @@ fn parse_vless_xhttp_config(
         }
     }
 
-    Ok(XhttpConfig {
+    let session_length = range_option("session-length", (16, 32))?;
+    // These alter the wire format / destination. Until implemented, fail
+    // closed rather than load a node that dials using different semantics.
+    for key in ["download-config"] {
+        if xhttp_opts.is_some_and(|opts| opts.get(key).is_some()) {
+            return Err(format!("vless: xhttp-opts.{key} is not implemented"));
+        }
+    }
+    let parsed = XhttpConfig {
         path,
         hosts,
         scheme: if tls { "https" } else { "http" }.to_string(),
         extra_headers,
         mode,
+        has_reality: config
+            .get("reality-opts")
+            .and_then(|o| o.get("public-key"))
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        uplink_http_method: {
+            let method = string_option("uplink-http-method", "POST")?;
+            if method.is_empty() {
+                "POST".into()
+            } else {
+                method
+            }
+        },
+        seq_placement: string_option("seq-placement", "path")?,
+        seq_key: string_option("seq-key", "")?,
+        uplink_data_placement: string_option("uplink-data-placement", "body")?,
+        uplink_data_key: string_option("uplink-data-key", "")?,
+        uplink_chunk_size: range_option("uplink-chunk-size", (0, 0))?,
+        sc_max_each_post_bytes: range_option("sc-max-each-post-bytes", (1_000_000, 1_000_000))?,
+        sc_min_posts_interval_ms: range_option("sc-min-posts-interval-ms", (30, 30))?,
         no_grpc_header,
         x_padding_bytes,
-    })
+        x_padding_obfs_mode: bool_option("x-padding-obfs-mode", false)?,
+        x_padding_method: string_option("x-padding-method", "")?,
+        x_padding_placement: string_option("x-padding-placement", "")?,
+        x_padding_header: string_option("x-padding-header", "")?,
+        x_padding_key: string_option("x-padding-key", "")?,
+        session_placement: string_option("session-placement", "path")?,
+        session_key: string_option("session-key", "")?,
+        session_table: string_option("session-table", "")?,
+        session_length,
+    };
+    parsed
+        .validate()
+        .map_err(|error| format!("vless: {error}"))?;
+    Ok(parsed)
 }
 
 /// Parse the VLESS `encryption` field.
@@ -2313,9 +2429,18 @@ fn parse_vless_reality_opts(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<meow_transport::tls::RealityConfig>, String> {
-    let Some(opts) = config.get("reality-opts") else {
+    let Some(opts) = config.get("reality-opts").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if !opts.is_mapping() {
+        return Err("vless: reality-opts must be a mapping".into());
+    }
+    if opts
+        .get("public-key")
+        .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+    {
+        return Ok(None);
+    }
 
     let public_key_str = opts
         .get("public-key")

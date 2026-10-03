@@ -235,6 +235,9 @@ pub struct H2Stream {
     remote_no_error_is_eof: bool,
     eos_sent: bool,
     conn_driver: Option<tokio::task::JoinHandle<()>>,
+    // A split XHTTP upload has its own acknowledgement response. Box it so
+    // other h2 transports pay only one pointer, not a second RecvState.
+    auxiliary_recv: Option<Box<RecvState>>,
 }
 
 impl H2Stream {
@@ -247,12 +250,51 @@ impl H2Stream {
             remote_no_error_is_eof: false,
             eos_sent: false,
             conn_driver: None,
+            auxiliary_recv: None,
         }
     }
 
     pub fn with_conn_driver(mut self, driver: tokio::task::JoinHandle<()>) -> Self {
         self.conn_driver = Some(driver);
         self
+    }
+
+    /// Monitor and drain a second response without blocking payload writes
+    /// on headers that the peer may only send after request EOF.
+    pub fn with_auxiliary_recv(mut self, recv: RecvState) -> Self {
+        self.auxiliary_recv = Some(Box::new(recv));
+        self
+    }
+
+    fn poll_auxiliary(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let Some(recv) = &mut self.auxiliary_recv else {
+            return Ok(());
+        };
+        match recv.poll_ready(cx) {
+            Poll::Pending => return Ok(()),
+            Poll::Ready(result) => result?,
+        }
+        let stream = recv.stream().expect("poll_ready resolved Ok");
+        // A peer sending an endless acknowledgement body must not monopolise
+        // the executor. Release each frame immediately; retain no body bytes.
+        for _ in 0..16 {
+            match stream.poll_data(cx) {
+                Poll::Pending => return Ok(()),
+                Poll::Ready(None) => {
+                    self.auxiliary_recv = None;
+                    return Ok(());
+                }
+                Poll::Ready(Some(Err(error))) => return Err(h2_to_io(error)),
+                Poll::Ready(Some(Ok(bytes))) => {
+                    stream
+                        .flow_control()
+                        .release_capacity(bytes.len())
+                        .map_err(h2_to_io)?;
+                }
+            }
+        }
+        cx.waker().wake_by_ref();
+        Ok(())
     }
 
     pub fn with_remote_no_error_eof(mut self) -> Self {
@@ -286,6 +328,7 @@ impl Drop for H2Stream {
             return;
         };
         let recv = self.recv.take();
+        let auxiliary_recv = self.auxiliary_recv.take();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             driver.abort();
             return;
@@ -300,7 +343,12 @@ impl Drop for H2Stream {
                         recv.drain().await;
                     }
                 };
-                let _ = tokio::join!(drain, &mut driver);
+                let auxiliary_drain = async {
+                    if let Some(recv) = auxiliary_recv {
+                        (*recv).drain().await;
+                    }
+                };
+                let _ = tokio::join!(drain, auxiliary_drain, &mut driver);
             };
             if tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, finish)
                 .await
@@ -325,6 +373,9 @@ impl AsyncRead for H2Stream {
         // parked forever).
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
+        }
+        if let Err(error) = this.poll_auxiliary(cx) {
+            return Poll::Ready(Err(error));
         }
         loop {
             if !this.read_buf.is_empty() {
@@ -372,6 +423,9 @@ impl AsyncWrite for H2Stream {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
+        if let Err(error) = this.poll_auxiliary(cx) {
+            return Poll::Ready(Err(error));
+        }
         // Stash the payload exactly once per parked write.  If
         // pending_write is set, the previous poll returned Pending and
         // capacity has been reserved — do not copy or reserve again.
@@ -455,13 +509,14 @@ impl AsyncWrite for H2Stream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.get_mut().poll_auxiliary(cx))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().best_effort_eos();
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.best_effort_eos();
+        Poll::Ready(this.poll_auxiliary(cx))
     }
 }
 

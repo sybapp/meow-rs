@@ -53,7 +53,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
 | `proxies:` — Direct, Reject | ✓ | Fully supported. |
 | `proxies:` — VMess | ✓ | AEAD VMess outbound with TCP/WebSocket transports. |
-| `proxies:` — VLESS | ✓ | Plain VLESS, XTLS-Vision, Reality/uTLS, and post-quantum Encryption (`mlkem768x25519plus`) in the default app build. |
+| `proxies:` — VLESS | ✓ | Plain VLESS, XTLS-Vision, Reality/uTLS, XHTTP H2/H3, and post-quantum Encryption (`mlkem768x25519plus`) in the default app build. |
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |

@@ -65,7 +65,12 @@ xhttp = [
     "dep:h2",
     "dep:http",
     "dep:rand",
+    "dep:base64",
+    "dep:form_urlencoded",
 ]
+# HTTP/3 XHTTP over QUIC, sharing the workspace BoringSSL.
+xhttp3 = ["xhttp", "tls", "dep:quiche"]
+
 # simple-obfs (SIP004): a stream-wrapper codec that frames shadowsocks traffic
 # as fake HTTP / TLS so a passive observer sees plain web traffic. Used by both
 # the outbound SS/Snell adapters (client side, here as `simple_obfs::client`)
@@ -142,10 +147,12 @@ chacha20poly1305 = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util      = { workspace = true, optional = true }
 base64            = { workspace = true, optional = true }
+form_urlencoded   = { version = "1", optional = true }
 
 # grpc + h2 features (share the h2 crate; see ADR-0001 §5 note on intentional dep sharing)
 h2   = { version = "0.4", optional = true }
 http = { workspace = true, optional = true }
+quiche = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
 # httpupgrade feature
@@ -202,6 +209,8 @@ foreign-types      = { workspace = true, optional = true }
 webpki-root-certs  = { version = "1", optional = true }
 
 [dev-dependencies]
+hex = { workspace = true }
+serde_json = { workspace = true }
 # `test-util` enables paused-time tests (start_paused / time::advance) —
 # not part of tokio's `full` set.
 tokio        = { workspace = true, features = ["test-util"] }
@@ -258,3 +267,11 @@ required-features = ["xhttp"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "xhttp3_test"
+required-features = ["xhttp3"]
+
+[[test]]
+name = "xhttp_mihomo_interop"
+required-features = ["xhttp3"]
