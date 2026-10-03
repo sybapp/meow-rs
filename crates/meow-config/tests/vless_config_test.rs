@@ -311,6 +311,15 @@ proxies:
 /// Reality is tied to a uTLS fingerprint upstream; require the field at config
 /// time so the user cannot accidentally get plain TLS semantics.
 #[tokio::test]
+async fn parse_vless_reality_hybrid_flag_is_typed() {
+    for (flag, valid) in [("true", true), ("false", true), ("'true'", false)] {
+        let yaml = format!("proxies:\n  - name: reality-hybrid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\n      short-id: abcd\n      support-x25519mlkem768: {flag}\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(config.proxies.contains_key("reality-hybrid"), valid);
+    }
+}
+
+#[tokio::test]
 async fn parse_vless_reality_opts_requires_fingerprint() {
     let yaml = r#"
 proxies:

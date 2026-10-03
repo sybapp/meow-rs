@@ -366,7 +366,7 @@ pub fn parse_subscription_yaml(
             // tracked in `applied-proxies`, or removed on refresh/delete —
             // it would re-append on every apply and accumulate forever
             // (issue #640 review). Same shape-defect gating as below.
-            if !hm.get("name").is_some_and(|v| v.as_str().is_some()) {
+            if hm.get("name").is_none_or(|v| v.as_str().is_none()) {
                 if strict {
                     return Err(anyhow::anyhow!(
                         "subscription 'proxies' entry has no string 'name' \

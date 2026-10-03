@@ -52,6 +52,10 @@ use crate::{Result, Stream, Transport, TransportError};
 
 pub(crate) mod boring_backend;
 pub(crate) mod boring_stream;
+#[cfg(any(feature = "reality", feature = "restls"))]
+pub(crate) mod certificate;
+#[cfg(any(feature = "reality", feature = "restls"))]
+pub(crate) mod key_share;
 
 use boring_backend::{BoringInner, LazyBoringInner};
 
@@ -80,6 +84,7 @@ pub enum EchOpts {
 pub struct RealityConfig {
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
+    /// Offer standard X25519MLKEM768 first, with the same X25519 fallback.
     pub support_x25519_mlkem768: bool,
 }
 

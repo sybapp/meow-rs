@@ -307,6 +307,21 @@ jobs:
             --test snell_server_docker_integration \
             --test xray_server_docker_integration --retries 2 --no-fail-fast
 
+      - name: Set up Go (independent REALITY peer)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/reality-peer/go.mod
+          cache: false
+
+      - name: Build independent REALITY TLS peer
+        working-directory: crates/meow-transport/tests/support/reality-peer
+        run: go build -o "${{ runner.temp }}/reality-peer" .
+
+      - name: Native REALITY independent TLS interoperability
+        env:
+          MEOW_REALITY_PEER_BIN: ${{ runner.temp }}/reality-peer
+        run: cargo nextest run -p meow-transport --features reality --test reality_mihomo_interop --no-fail-fast
+
       - name: AnyTLS unit and integration tests (embedded server)
         run: |
           cargo nextest run -p meow-anytls --lib --retries 2 --no-fail-fast

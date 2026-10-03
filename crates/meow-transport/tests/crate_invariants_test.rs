@@ -93,7 +93,10 @@ fn no_server_side_symbols_in_src() {
             }
         }
         let test_only = test_only_lines(path, content);
-        for (line_no, line) in content.lines().enumerate() {
+        // HTTP header names (e.g. "accept") are protocol data, not
+        // socket/listener operations. Keep offsets for useful diagnostics.
+        let code = blank_literals_and_comments(content);
+        for ((line_no, line), code_line) in content.lines().enumerate().zip(code.lines()) {
             // Skip comment lines — doc comments that *describe* the restriction
             // are not violations.  Only live code is checked.
             if line.trim().starts_with("//") {
@@ -104,7 +107,7 @@ fn no_server_side_symbols_in_src() {
                 continue;
             }
             for (re, pat) in regexes.iter().zip(forbidden_patterns.iter()) {
-                if re.is_match(line) {
+                if re.is_match(code_line) {
                     violations.push(format!(
                         "{}:{}: '{}' matches pattern '{}'",
                         path.display(),
@@ -122,6 +125,14 @@ fn no_server_side_symbols_in_src() {
         "Server-side symbols found in src/ (ADR-0001 §1, acceptance criterion #8):\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn server_guard_ignores_wire_header_names_but_keeps_socket_calls() {
+    let code = blank_literals_and_comments(r#"headers.insert("accept", "*/*"); socket.accept();"#);
+    let re = regex::Regex::new(r"\baccept\b").unwrap();
+    assert_eq!(re.find_iter(&code).count(), 1);
+    assert!(code.contains("socket.accept()"));
 }
 
 fn walk_rs_files(dir: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
