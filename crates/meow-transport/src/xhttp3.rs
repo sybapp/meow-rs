@@ -238,6 +238,31 @@ fn quic_io(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("XHTTP/3: {e}"))
 }
 
+// quic-go schedules one idle PING at min(period, idle/2), at least
+// 1.5 PTO after the last received packet. QUIC itself handles retransmission;
+// do not send periodic extra probes while traffic or an earlier PING is active.
+fn keepalive_delay(conn: &quiche::Connection) -> Duration {
+    let peer = conn.peer_transport_params();
+    let idle = peer
+        .filter(|p| p.max_idle_timeout != 0)
+        .map_or(Duration::from_secs(300), |p| {
+            Duration::from_millis(p.max_idle_timeout).min(Duration::from_secs(300))
+        });
+    let period = Duration::from_secs(10).min(idle / 2);
+    let ack = peer.map_or(Duration::from_millis(25), |p| {
+        Duration::from_millis(p.max_ack_delay)
+    });
+    let pto = conn
+        .path_stats()
+        .find(|p| p.active)
+        .map_or(Duration::ZERO, |p| {
+            p.rtt
+                .saturating_add(p.rttvar.saturating_mul(4).max(Duration::from_millis(1)))
+                .saturating_add(ack)
+        });
+    period.max(pto.saturating_mul(3) / 2)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "one connection driver owns its IO and both request streams"
@@ -257,11 +282,8 @@ async fn drive(
     let (mut app_read, mut app_write) = tokio::io::split(pump);
     let mut ready = Some(ready);
     let mut finished = Some(finished);
-    let mut keepalive = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(15),
-        Duration::from_secs(15),
-    );
-    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_receive = tokio::time::Instant::now();
+    let mut ping_pending = false;
     let mut h3 = None;
     let mut upload = 0;
     let mut download = 0;
@@ -548,14 +570,23 @@ async fn drive(
         let read_limit = packet
             .as_ref()
             .map_or(CHUNK, |p| CHUNK.min(p.max - p.buffer.len()));
+        let keepalive_wait = (last_receive + keepalive_delay(&conn))
+            .saturating_duration_since(tokio::time::Instant::now());
         tokio::select! {
             n = socket.recv(&mut incoming) => {
                 let n = n?;
                 if let Some(packet) = &mut packet { packet.request_blocked = false; }
                 if n > incoming.len() { return Err(quic_io("oversized datagram")); }
+                let received = conn.stats().recv;
                 match conn.recv(&mut incoming[..n], quiche::RecvInfo { from: peer, to: local }) {
                     Ok(_) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidPacket) => {},
                     Err(e) => return Err(quic_io(e)),
+                }
+                // Re-arm only for accepted QUIC packets. Junk UDP must not
+                // keep an otherwise dead transport alive.
+                if conn.stats().recv > received {
+                    last_receive = tokio::time::Instant::now();
+                    ping_pending = false;
                 }
             }
             n = app_read.read(&mut up[..read_limit]), if h3.is_some() && (packet.is_some() || up_pos == up_len) && !app_eof && read_limit > 0 => {
@@ -568,7 +599,14 @@ async fn drive(
                             let delay = rand::rng().random_range(packet.config.sc_min_posts_interval_ms.0..=packet.config.sc_min_posts_interval_ms.1);
                             packet.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(delay as u64));
                         }
-                        packet.buffer.reserve_exact(n);
+                        // Grow geometrically without reserving past the configured
+                        // packet cap; small writes must not repeatedly copy an
+                        // almost-full packet while awaiting its acknowledgement.
+                        let needed = packet.buffer.len() + n;
+                        if needed > packet.buffer.capacity() {
+                            let capacity = needed.next_power_of_two().min(packet.max);
+                            packet.buffer.reserve_exact(capacity - packet.buffer.len());
+                        }
                         packet.buffer.extend_from_slice(&up[..n]);
                     }
                 } else {
@@ -581,9 +619,9 @@ async fn drive(
             n = app_write.write(&down[down_pos..down_len]), if down_pos < down_len => {
                 down_pos += n?;
             }
-            _ = keepalive.tick(), if h3.is_some() => {
+            _ = tokio::time::sleep(keepalive_wait), if h3.is_some() && !ping_pending => {
                 match conn.send_ack_eliciting() {
-                    Ok(()) | Err(quiche::Error::Done) => {},
+                    Ok(()) | Err(quiche::Error::Done) => ping_pending = true,
                     Err(e) => return Err(quic_io(e)),
                 }
             }

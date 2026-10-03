@@ -449,14 +449,16 @@ pub(crate) fn xhttp3_config(config: &TlsConfig) -> Result<quiche::Config> {
         .map_err(|e| TransportError::Tls(e.to_string()))?;
     quic.set_application_protos(&[b"h3"])
         .map_err(|e| TransportError::Tls(e.to_string()))?;
-    quic.set_max_idle_timeout(30_000);
+    // Match mihomo/quic-go; keep-alive belongs to the connection driver.
+    quic.set_max_idle_timeout(300_000);
     quic.set_initial_max_data(512 * 1024);
     quic.set_max_connection_window(512 * 1024);
     quic.set_max_stream_window(256 * 1024);
     quic.set_initial_max_stream_data_bidi_local(256 * 1024);
     quic.set_initial_max_stream_data_bidi_remote(256 * 1024);
     quic.set_initial_max_stream_data_uni(16 * 1024);
-    quic.set_initial_max_streams_bidi(2);
+    // Only the client opens bidirectional HTTP requests.
+    quic.set_initial_max_streams_bidi(0);
     quic.set_initial_max_streams_uni(3);
     quic.set_max_recv_udp_payload_size(1500);
     quic.set_max_send_udp_payload_size(1200);

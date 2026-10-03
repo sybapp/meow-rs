@@ -252,3 +252,24 @@ async fn dropped_established_stream_releases_stalled_udp_driver() {
     .expect("drop must release stalled connection within the one-second grace");
     peer.task.abort();
 }
+
+#[tokio::test]
+async fn heartbeat_keeps_a_short_idle_peer_alive_without_application_traffic() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let peer =
+            support::peer_with_idle_timeout("127.0.0.1:0", false, 200, 204, false, false, 1000)
+                .await;
+        let mut stream = open(&peer, false).await;
+        // More than two negotiated idle periods: a fixed ten-second timer
+        // cannot preserve this connection. The driver must use idle/2.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        stream.write_all(b"alive").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        stream.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"alive");
+        peer.task.await.unwrap();
+    })
+    .await
+    .expect("idle keep-alive deadline");
+}

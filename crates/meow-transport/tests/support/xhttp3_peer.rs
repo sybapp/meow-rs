@@ -17,6 +17,18 @@ pub async fn peer(
     deferred: bool,
     vless: bool,
 ) -> Peer {
+    peer_with_idle_timeout(bind, split, status, upload_status, deferred, vless, 30_000).await
+}
+
+pub async fn peer_with_idle_timeout(
+    bind: &str,
+    split: bool,
+    status: u16,
+    upload_status: u16,
+    deferred: bool,
+    vless: bool,
+    idle_ms: u64,
+) -> Peer {
     let cert = rcgen::generate_simple_self_signed(vec!["example.org".into()]).unwrap();
     let root = cert.cert.der().to_vec();
     let mut ssl = SslContextBuilder::new(SslMethod::tls()).unwrap();
@@ -34,7 +46,7 @@ pub async fn peer(
     config.set_initial_max_stream_data_uni(16 * 1024);
     config.set_initial_max_streams_bidi(2);
     config.set_initial_max_streams_uni(3);
-    config.set_max_idle_timeout(30_000);
+    config.set_max_idle_timeout(idle_ms);
     let socket = UdpSocket::bind(bind).await.unwrap();
     let addr = socket.local_addr().unwrap();
     let task = tokio::spawn(async move {
