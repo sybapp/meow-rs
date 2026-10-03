@@ -310,6 +310,8 @@ the canonical, in-repo source a release is cut from.
   provider build, `PUT /configs` validation, and `POST` — matching
   `dialer-proxy` posture.
 
+- Native REALITY: optional standard X25519MLKEM768, authenticated signatures and Finished, three TLS 1.3 cipher suites, curve retries, authenticated cover fallback, and post-handshake traffic updates.
+
 ### Changed
 
 - **Snell AES-128-GCM runs on BoringSSL (#659).** The v3–v6 record
@@ -437,6 +439,9 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
+
+- Clear inherited obfs/KCP/subscription Clippy warnings without behavior changes.
+
 
 - **`meow -t` and startup now reject inbounds the binary did not
   compile.** A `listeners:` entry such as `type: shadowsocks` without

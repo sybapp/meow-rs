@@ -2,12 +2,16 @@
 
 **Status:** draft for issue #225  
 **Branch:** `fix/vless-reality`  
-**Last updated:** 2026-06-16  
+**Last updated:** 2026-10-02
 
 This document records the local implementation design and validation method for
 VLESS + Reality + XTLS-Vision. The runtime test sample is
 `/tmp/meow-reality-one.yml`, but this document intentionally does not include
 real proxy server details.
+
+The [current parity matrix](../mihomo-reality-parity.md) records remaining
+mihomo differences and independent test coverage. Complete browser fingerprint
+profiles, HelloRetryRequest and ordinary-certificate camouflage remain pending.
 
 ## Redaction Rules
 
@@ -50,7 +54,7 @@ Downloaded subscription configs should stay under `/tmp`, for example
 
 ## Design Constraints
 
-- Do not use a third-party Reality / XTLS / VLESS protocol implementation.
+- Do not use a third-party Reality / XTLS / VLESS protocol implementation in the runtime. Independent test-only peers are permitted.
 - Do not vendor xray or mihomo code.
 - It is acceptable to reference `/Users/jiawengeng/code/mihomo` for behavior and
   wire layout, but the implementation must live in meow-rs crates.
@@ -78,9 +82,7 @@ Out of scope:
 
 - VLESS inbound / server mode.
 - Vision UDP splice. UDP still uses plain VLESS and logs a config warning.
-- Hybrid `support-x25519mlkem768` key share. The config field is retained, but
-  the current ClientHello only sends X25519.
-- Mux.Cool.
+- This document does not expand the existing Mux.Cool implementation.
 - Committing the test sample or subscription nodes as repository fixtures.
 
 ## Config Entry Point
@@ -91,8 +93,7 @@ Out of scope:
   32-byte X25519 public key.
 - `short-id`: hex string up to 8 bytes. The decoded value is zero-padded to
   8 bytes.
-- `support-x25519mlkem768`: boolean. It is stored in `RealityConfig`, but does
-  not change ClientHello generation yet.
+- `support-x25519mlkem768`: boolean. True enables the standard hybrid group and X25519 fallback; false offers only X25519.
 
 Config constraints:
 
@@ -125,18 +126,21 @@ Handshake flow:
 3. Build a TLS 1.3 ClientHello:
    - SNI comes from `servername`, falling back to `server`.
    - ALPN comes from YAML `alpn`.
-   - `key_share` currently sends X25519.
+   - `key_share` sends X25519, with an optional standard ML-KEM768 hybrid share.
    - `session_id` contains Reality auth data: version, timestamp, and short-id,
      sealed with an AES-GCM key derived from the auth key.
 4. Send the plaintext TLS handshake record.
 5. Read ServerHello and validate:
    - The server echoed the ClientHello `session_id`.
    - TLS 1.3 was negotiated.
-   - `key_share` is X25519.
+   - `key_share` is an advertised X25519 or X25519MLKEM768 group.
    - The current supported cipher suite is `TLS_AES_128_GCM_SHA256`.
 6. Run the handwritten TLS 1.3 handshake/application key schedule.
-7. Decrypt EncryptedExtensions, Certificate, CertificateVerify, and Finished.
-8. Verify the Reality certificate signature HMAC with the Reality auth key.
+7. Reassemble/decrypt fragmented or coalesced EncryptedExtensions, Certificate,
+   CertificateVerify, and Finished. Verify the Ed25519 CertificateVerify signature
+   against the TLS transcript and authenticate server Finished.
+8. Verify the Reality certificate signature HMAC with the Reality auth key using
+   a constant-time MAC comparison.
 9. Send client Finished and enter application data record mode.
 
 `RealityTlsStream` is responsible for:

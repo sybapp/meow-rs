@@ -37,11 +37,16 @@ boring-tls = ["tls", "reality"]
 # reality: xray REALITY client handshake (issue #377). The record layer, the
 # X25519 / HKDF / AES-GCM crypto and the ClientHello builder are all in-tree
 # (`reality_tls.rs`) on top of the always-present aes-gcm/hmac/sha2 deps, so
-# this does not touch BoringSSL at all.
+# the TLS record layer stays native; shared BoringSSL helpers validate
+# certificates and generate retry key shares.
 reality = [
     "tls",
+    "dep:h2",
+    "dep:http",
+    "dep:chacha20poly1305",
     "dep:rand",
     "dep:x25519-dalek",
+    "dep:ml-kem",
 ]
 ws = [
     "dep:tokio-tungstenite",
@@ -153,6 +158,7 @@ httparse = { version = "1", optional = true }
 
 # reality feature — pure-Rust X25519 for the REALITY handshake.
 x25519-dalek = { workspace = true, optional = true }
+ml-kem = { workspace = true, optional = true }
 
 # kcptun feature — see the `kcptun` feature comment above for why aes is pinned
 # to the cipher-0.5 line while vmess's aes stays on 0.8.
@@ -202,6 +208,8 @@ foreign-types      = { workspace = true, optional = true }
 webpki-root-certs  = { version = "1", optional = true }
 
 [dev-dependencies]
+hex = { workspace = true }
+serde_json = { workspace = true }
 # `test-util` enables paused-time tests (start_paused / time::advance) —
 # not part of tokio's `full` set.
 tokio        = { workspace = true, features = ["test-util"] }
@@ -219,6 +227,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 regex = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
+
+[[test]]
+name = "reality_mihomo_interop"
+required-features = ["reality"]
 
 [[test]]
 name = "boring_tls_test"

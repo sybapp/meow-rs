@@ -2305,17 +2305,25 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 ///
 /// Matches mihomo's wire-facing fields: `public-key` is base64 RawURL X25519,
 /// `short-id` is hex-decoded and zero-padded to eight bytes, and
-/// `support-x25519mlkem768` is a capability flag. The TLS layer currently
-/// offers X25519 only; keeping the flag in config preserves the public surface
-/// for future fingerprint-specific ClientHello work.
+/// `support-x25519mlkem768` enables standard hybrid key shares with classical
+/// fallback. Browser-specific ClientHello layouts remain a separate task.
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<meow_transport::tls::RealityConfig>, String> {
-    let Some(opts) = config.get("reality-opts") else {
+    let Some(opts) = config.get("reality-opts").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if !opts.is_mapping() {
+        return Err("vless: reality-opts must be a mapping".into());
+    }
+    if opts
+        .get("public-key")
+        .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+    {
+        return Ok(None);
+    }
 
     let public_key_str = opts
         .get("public-key")
@@ -2386,10 +2394,12 @@ fn parse_vless_reality_opts(
     let mut short_id = [0u8; 8];
     short_id[..short_id_vec.len()].copy_from_slice(&short_id_vec);
 
-    let support_x25519_mlkem768 = opts
-        .get("support-x25519mlkem768")
-        .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false);
+    let support_x25519_mlkem768 = match opts.get("support-x25519mlkem768") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            "vless: reality-opts.support-x25519mlkem768 must be a boolean".to_string()
+        })?,
+    };
 
     Ok(Some(meow_transport::tls::RealityConfig {
         public_key,
