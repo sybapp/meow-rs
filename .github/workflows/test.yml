@@ -339,6 +339,11 @@ jobs:
             --test xhttp_mihomo_interop \
             --test httpupgrade_test --retries 2 --no-fail-fast
 
+      - name: VLESS XHTTP parser and reusable endpoint interop
+        env:
+          MEOW_XHTTP_PEER_BIN: ${{ runner.temp }}/mihomo-xhttp-peer
+        run: cargo nextest run -p meow-config --test vless_xhttp_endpoint_interop --no-fail-fast
+
   features:
     runs-on: ubuntu-latest
     needs: lint

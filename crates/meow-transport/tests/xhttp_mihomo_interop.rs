@@ -309,3 +309,90 @@ async fn reality_cover_certificate_and_camouflage() {
         }).await.expect("cover handshake deadline");
     }
 }
+
+struct TcpFactory {
+    address: SocketAddr,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    internal: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+#[async_trait]
+impl meow_transport::xhttp::ConnectionFactory for TcpFactory {
+    async fn connect(
+        &self,
+        internal: bool,
+    ) -> meow_transport::Result<Box<dyn meow_transport::Stream>> {
+        self.dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.internal.lock().unwrap().push(internal);
+        Ok(Box::new(TcpStream::connect(self.address).await?))
+    }
+}
+async fn echo_shared(mut stream: Box<dyn meow_transport::Stream>, size: usize) {
+    let data: Vec<_> = (0..=255).cycle().take(size).collect();
+    let (mut read, mut write) = tokio::io::split(&mut stream);
+    let send = async {
+        write.write_all(&data).await.unwrap();
+        write.shutdown().await.unwrap();
+    };
+    let receive = async {
+        let mut result = Vec::new();
+        read.read_to_end(&mut result).await.unwrap();
+        assert_eq!(result, data);
+    };
+    tokio::join!(send, receive);
+}
+
+#[tokio::test]
+async fn mihomo_h2_reuse_download_probe_isolation_and_reset() {
+    use meow_transport::xhttp::{ReuseConfig, XhttpClient, XhttpEndpoint};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in ["stream-one", "stream-up", "packet-up", "auto"] {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let size = 8193;
+            let split = mode != "stream-one";
+            let mut peer = Command::new(std::env::var("MEOW_XHTTP_PEER_BIN").expect("independent peer required"))
+                .args(["-protocol", "h2", "-capture", "-config", "{\"Host\":\"example.org\",\"Path\":\"/up\",\"Mode\":\"auto\",\"SessionPlacement\":\"header\",\"SessionKey\":\"X-Session\",\"XPaddingBytes\":\"16\"}", "-bytes", "8193"])
+                .args(if split { vec!["-dual", "-download-path", "/down", "-download-host", "download.org"] } else { vec![] })
+                .stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
+            let mut output = BufReader::new(peer.stdout.take().unwrap());
+            let mut startup = String::new(); output.read_line(&mut startup).await.unwrap();
+            let info: serde_json::Value = serde_json::from_str(&startup).unwrap();
+            let up_count = Arc::new(AtomicUsize::new(0));
+            let down_count = Arc::new(AtomicUsize::new(0));
+            let up_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let down_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let config = XhttpConfig { path: "/up".into(), hosts: vec!["example.org".into()], mode: mode.into(), has_reality: mode == "auto", session_placement: "header".into(), session_key: "X-Session".into(), sc_min_posts_interval_ms: (1,1), ..config() };
+            let up = Arc::new(XhttpEndpoint::new(config.clone(), Arc::new(TcpFactory { address: info["address"].as_str().unwrap().parse().unwrap(), dials: Arc::clone(&up_count), internal: Arc::clone(&up_flags) }), Some(ReuseConfig::default()), -1).unwrap());
+            let down = split.then(|| Arc::new(XhttpEndpoint::new(XhttpConfig { path: "/down".into(), hosts: vec!["download.org".into()], extra_headers: vec![("X-Download".into(), "separate".into())], ..config }, Arc::new(TcpFactory { address: info["download-address"].as_str().unwrap().parse().unwrap(), dials: Arc::clone(&down_count), internal: Arc::clone(&down_flags) }), Some(ReuseConfig::default()), -1).unwrap()));
+            let client = XhttpClient::new(up, down).unwrap();
+            let first = client.connect(false).await.unwrap();
+            let second = client.connect(false).await.unwrap();
+            assert_eq!(up_count.load(Ordering::Relaxed), 1, "two tunnels share one physical connection");
+            echo_shared(first, size).await;
+            let third = client.connect(false).await.unwrap();
+            assert_eq!(up_count.load(Ordering::Relaxed), 1, "dropping a tunnel preserves its peer's transport");
+            client.reset();
+            let fourth = client.connect(false).await.unwrap();
+            assert_eq!(up_count.load(Ordering::Relaxed), 2);
+            let probe = client.connect(true).await.unwrap();
+            assert_eq!(up_count.load(Ordering::Relaxed), 3);
+            tokio::join!(echo_shared(second, size), echo_shared(third, size), echo_shared(fourth, size), echo_shared(probe, size));
+            assert_eq!(*up_flags.lock().unwrap(), [false, false, true]);
+            if split {
+                assert_eq!(down_count.load(Ordering::Relaxed), 3);
+                assert_eq!(*down_flags.lock().unwrap(), [false, false, true]);
+            }
+            peer.kill().await.unwrap(); peer.wait().await.unwrap();
+            let mut rows = String::new(); output.read_to_string(&mut rows).await.unwrap();
+            let rows: Vec<serde_json::Value> = rows.lines().map(|r| serde_json::from_str(r).unwrap()).collect();
+            let downloads: Vec<_> = rows.iter().filter(|r| r["download"] == true).collect();
+            assert_eq!(downloads.len(), if split { 5 } else { 0 });
+            for request in downloads {
+                assert_eq!(request["method"], "GET");
+                assert!(request["path"].as_str().unwrap().starts_with("/down"));
+                assert_eq!(request["host"], "download.org");
+                assert_eq!(request["headers"]["X-Download"][0], "separate");
+            }
+        }).await.unwrap_or_else(|_| panic!("shared H2 {mode} deadline"));
+    }
+}

@@ -1,3 +1,5 @@
+#[cfg(feature = "vless")]
+mod xhttp;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
@@ -16,6 +18,11 @@ use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "vless")]
+use xhttp::{
+    apply_vless_tls_identity, build_xhttp_h2_endpoint, parse_xhttp_download_settings,
+    parse_xhttp_download_tls, reject_xhttp3_connection_options,
+};
 
 fn required_port(
     config: &HashMap<String, serde_yaml::Value>,
@@ -1488,20 +1495,18 @@ fn parse_vless(
         .unwrap_or("tcp");
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
-    let use_h3 = network == "xhttp" && alpn.iter().any(|p| p == "h3" || p.starts_with("h3-"));
-    if use_h3 && (!tls || alpn.iter().any(|p| p != "h3")) {
-        return Err(
-            "vless: XHTTP/3 requires tls: true and alpn: [h3] (draft/mixed ALPN unsupported)"
-                .into(),
-        );
+    // Upstream selects H3/H1 only for an exact singleton ALPN; every other
+    // configured list uses the H2 backend and forces h2 in the TLS handshake.
+    let use_h3 = network == "xhttp" && alpn == ["h3"];
+    if use_h3 && !tls {
+        return Err("vless: XHTTP/3 requires tls: true".into());
     }
-    if network == "xhttp" && !use_h3 && alpn.iter().any(|p| p != "h2") {
-        return Err(
-            "vless: XHTTP currently requires alpn: [h2] or [h3]; HTTP/1.1 and mixed ALPN are not implemented"
-                .into(),
-        );
+    if network == "xhttp" && alpn == ["http/1.1"] {
+        return Err("vless: XHTTP HTTP/1.1 backend is not implemented".into());
     }
     let mut h3_client = None;
+    let mut xhttp_client = None;
+    let mut xhttp_tls = None;
 
     // ── Reality opts ──────────────────────────────────────────────────────
     let reality = parse_vless_reality_opts(name, config)?;
@@ -1530,8 +1535,7 @@ fn parse_vless(
 
     // ── client-fingerprint ──────────────────────────────────────────────
     // Passed through to TlsConfig.fingerprint; the TLS layer selects the
-    // BoringSSL backend when the `boring-tls` feature is compiled in,
-    // otherwise falls back to rustls with a stub warning.
+    // BoringSSL backend for ordinary TLS and the native REALITY record layer.
 
     // ── Flow parsing ──────────────────────────────────────────────────────
     let flow_str = config.get("flow").and_then(|v| v.as_str()).unwrap_or("");
@@ -1646,9 +1650,14 @@ fn parse_vless(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        tls_cfg.alpn = default_transport_alpn(network, alpn);
+        tls_cfg.alpn = if network == "xhttp" && !use_h3 {
+            vec!["h2".into()]
+        } else {
+            default_transport_alpn(network, alpn)
+        };
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         tls_cfg.reality = reality;
+        apply_vless_tls_identity(config, &mut tls_cfg)?;
 
         // ── ECH opts ────────────────────────────────────────────────────
         // DNS-sourced ECH (`enable: true` without `config:`) is resolved by
@@ -1674,7 +1683,11 @@ fn parse_vless(
             }
         }
 
+        if network == "xhttp" {
+            xhttp_tls = Some(tls_cfg.clone());
+        }
         if use_h3 {
+            reject_xhttp3_connection_options(config)?;
             let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
             h3_client = Some(
                 meow_transport::xhttp3::Xhttp3Client::new(xhttp_cfg, &tls_cfg)
@@ -1829,6 +1842,31 @@ fn parse_vless(
         "xhttp" => {
             if !use_h3 {
                 let xhttp_cfg = parse_vless_xhttp_config(config, server, &servername, tls)?;
+                let upload =
+                    build_xhttp_h2_endpoint(config, xhttp_cfg.clone(), xhttp_tls.as_ref(), dialer)?;
+                let download = parse_xhttp_download_settings(config)?
+                    .map(|download| {
+                        let host = download
+                            .get("server")
+                            .and_then(serde_yaml::Value::as_str)
+                            .ok_or("vless: download server must be a string")?;
+                        let sni = download
+                            .get("servername")
+                            .and_then(serde_yaml::Value::as_str)
+                            .unwrap_or(host);
+                        let tls = download
+                            .get("tls")
+                            .and_then(serde_yaml::Value::as_bool)
+                            .unwrap_or(false);
+                        let down_cfg = parse_vless_xhttp_config(&download, host, sni, tls)?;
+                        let tls_cfg = parse_xhttp_download_tls(name, &download, host, sni, tls)?;
+                        build_xhttp_h2_endpoint(&download, down_cfg, tls_cfg.as_ref(), dialer)
+                    })
+                    .transpose()?;
+                xhttp_client = Some(
+                    meow_transport::xhttp::XhttpClient::new(upload, download)
+                        .map_err(|e| format!("vless: {e}"))?,
+                );
                 chain.push(Box::new(meow_transport::xhttp::XhttpLayer::new(xhttp_cfg)));
             }
         }
@@ -1850,6 +1888,15 @@ fn parse_vless(
         chain,
         Arc::clone(dialer),
     );
+    if let Some(client) = xhttp_client {
+        let relay_supported = config
+            .get("xhttp-opts")
+            .and_then(|o| o.get("download-settings"))
+            .is_none_or(serde_yaml::Value::is_null);
+        adapter = adapter
+            .with_xhttp(client, relay_supported)
+            .map_err(|e| format!("vless: {e}"))?;
+    }
     if let Some(client) = h3_client {
         adapter = adapter
             .with_xhttp3(client)
@@ -2144,7 +2191,11 @@ fn parse_vless_xhttp_config(
     let hosts: Vec<String> = match xhttp_opts.and_then(|o| o.get("host")) {
         None => vec![fallback_host.to_string()],
         Some(value) if value.is_string() => {
-            vec![value.as_str().expect("checked string").to_string()]
+            vec![match value.as_str().expect("checked string") {
+                "" => fallback_host,
+                s => s,
+            }
+            .to_string()]
         }
         Some(value) if value.is_sequence() => value
             .as_sequence()
@@ -2249,7 +2300,7 @@ fn parse_vless_xhttp_config(
     let session_length = range_option("session-length", (16, 32))?;
     // These alter the wire format / destination. Until implemented, fail
     // closed rather than load a node that dials using different semantics.
-    for key in ["download-settings", "download-config", "reuse-settings"] {
+    for key in ["download-config"] {
         if xhttp_opts.is_some_and(|opts| opts.get(key).is_some()) {
             return Err(format!("vless: xhttp-opts.{key} is not implemented"));
         }
@@ -2260,7 +2311,11 @@ fn parse_vless_xhttp_config(
         scheme: if tls { "https" } else { "http" }.to_string(),
         extra_headers,
         mode,
-        has_reality: config.get("reality-opts").is_some(),
+        has_reality: config
+            .get("reality-opts")
+            .and_then(|o| o.get("public-key"))
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
         uplink_http_method: {
             let method = string_option("uplink-http-method", "POST")?;
             if method.is_empty() {
@@ -2366,17 +2421,25 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 ///
 /// Matches mihomo's wire-facing fields: `public-key` is base64 RawURL X25519,
 /// `short-id` is hex-decoded and zero-padded to eight bytes, and
-/// `support-x25519mlkem768` is a capability flag. The TLS layer currently
-/// offers X25519 only; keeping the flag in config preserves the public surface
-/// for future fingerprint-specific ClientHello work.
+/// `support-x25519mlkem768` enables standard hybrid key shares with classical
+/// fallback. Browser-specific ClientHello layouts remain a separate task.
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
 ) -> std::result::Result<Option<meow_transport::tls::RealityConfig>, String> {
-    let Some(opts) = config.get("reality-opts") else {
+    let Some(opts) = config.get("reality-opts").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if !opts.is_mapping() {
+        return Err("vless: reality-opts must be a mapping".into());
+    }
+    if opts
+        .get("public-key")
+        .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+    {
+        return Ok(None);
+    }
 
     let public_key_str = opts
         .get("public-key")

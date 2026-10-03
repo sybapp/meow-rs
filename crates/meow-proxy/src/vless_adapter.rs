@@ -68,6 +68,8 @@ pub struct VlessAdapter {
     encryption: Option<Arc<ClientInstance>>,
     health: ProxyHealth,
     uses_udp_transport: bool,
+    xhttp: Option<Arc<meow_transport::xhttp::XhttpClient>>,
+    xhttp_relay_supported: bool,
 }
 
 impl VlessAdapter {
@@ -106,7 +108,27 @@ impl VlessAdapter {
             encryption: None,
             health: ProxyHealth::new(),
             uses_udp_transport: false,
+            xhttp: None,
+            xhttp_relay_supported: true,
         }
+    }
+
+    /// Install reusable XHTTP endpoints before enabling VLESS multiplexing.
+    /// The ordinary transport chain remains available for single-use relays.
+    pub fn with_xhttp(
+        mut self,
+        client: meow_transport::xhttp::XhttpClient,
+        relay_supported: bool,
+    ) -> Result<Self> {
+        #[cfg(feature = "mux")]
+        if self.mux.is_some() {
+            return Err(MeowError::Config(
+                "configure XHTTP before enabling mux".into(),
+            ));
+        }
+        self.xhttp = Some(Arc::new(client));
+        self.xhttp_relay_supported = relay_supported;
+        Ok(self)
     }
 
     /// Use a QUIC-backed HTTP/3 dialer instead of the TCP transport chain.
@@ -152,6 +174,7 @@ impl VlessAdapter {
         let flow = self.flow;
         let dialer = Arc::clone(&self.dialer);
         let protocol = options.protocol;
+        let xhttp = self.xhttp.as_ref().map(Arc::clone);
         #[cfg(feature = "vless-encryption")]
         let encryption = self.encryption.clone();
 
@@ -159,17 +182,25 @@ impl VlessAdapter {
             let server = server.clone();
             let transport = StdArc::clone(&transport);
             let dialer = Arc::clone(&dialer);
+            let xhttp = xhttp.as_ref().map(Arc::clone);
             #[cfg(feature = "vless-encryption")]
             let encryption = encryption.clone();
             Box::pin(async move {
                 // Mux session dial — `internal: false`: a shared mux conn
                 // exists to serve user streams regardless of which dial
                 // triggered its establishment.
-                let stream = dialer
-                    .dial(&server, port, false)
-                    .await
-                    .map_err(MeowError::Io)?;
-                let stream = transport.connect(stream).await?;
+                let stream = if let Some(client) = &xhttp {
+                    client
+                        .connect(false)
+                        .await
+                        .map_err(crate::transport_to_proxy_err)?
+                } else {
+                    let raw = dialer
+                        .dial(&server, port, false)
+                        .await
+                        .map_err(MeowError::Io)?;
+                    transport.connect(raw).await?
+                };
                 #[cfg(feature = "vless-encryption")]
                 let stream = match &encryption {
                     Some(encryption) => encryption.handshake(stream).await?,
@@ -248,6 +279,17 @@ impl VlessAdapter {
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
     /// VLESS Encryption handshake if one is configured.
     async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
+        if let Some(client) = &self.xhttp {
+            let stream = client
+                .connect(internal)
+                .await
+                .map_err(crate::transport_to_proxy_err)?;
+            #[cfg(feature = "vless-encryption")]
+            if let Some(encryption) = &self.encryption {
+                return encryption.handshake(stream).await;
+            }
+            return Ok(stream);
+        }
         let stream = self
             .dialer
             .dial(&self.server, self.port, internal)
@@ -398,6 +440,9 @@ impl ProxyAdapter for VlessAdapter {
                 "XHTTP/3 needs a UDP association; TCP relay streams cannot carry QUIC".into(),
             ));
         }
+        if !self.xhttp_relay_supported {
+            return Err(MeowError::NotSupported("XHTTP download-settings needs independent connections; use dialer-proxy instead of a single relay stream".into()));
+        }
         #[cfg(feature = "mux")]
         if self.mux.is_some() {
             debug!("VLESS mux bypassed on relay-supplied stream (single-use)");
@@ -443,8 +488,11 @@ impl ProxyAdapter for VlessAdapter {
 
     /// Issue #695: close every pooled mux session so the next dial opens a
     /// fresh physical connection (see `MuxClient::reset`).
-    #[cfg(feature = "mux")]
     fn reset_sessions(&self) {
+        if let Some(client) = &self.xhttp {
+            client.reset();
+        }
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             mux.reset();
         }

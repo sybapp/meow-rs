@@ -203,3 +203,7 @@ pub(crate) fn transport_to_proxy_err(e: meow_transport::TransportError) -> meow_
 
 #[cfg(feature = "vless")]
 mod xhttp3_dialer;
+#[cfg(feature = "vless")]
+mod xhttp_dialer;
+#[cfg(feature = "vless")]
+pub use xhttp_dialer::XhttpDialerFactory;

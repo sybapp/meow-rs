@@ -1660,7 +1660,7 @@ async fn parse_vless_xhttp_invalid_split_options_skipped() {
         "x-padding-obfs-mode: true\n      x-padding-method: unknown",
         "x-padding-obfs-mode: true\n      x-padding-placement: header",
         "x-padding-obfs-mode: true\n      x-padding-placement: cookie",
-        "download-settings: {}",
+        "download-settings: {mode: stream-one}",
         "mode: 123",
     ] {
         let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    xhttp-opts:\n      {option}\n");
@@ -1752,8 +1752,8 @@ proxies:
 }
 
 #[tokio::test]
-async fn parse_vless_xhttp_h3_rejects_plaintext_and_mixed_alpn() {
-    for (tls, alpn) in [(false, "[h3]"), (true, "[h2, h3]"), (true, "[h3-29]")] {
+async fn parse_vless_xhttp_h3_rejects_plaintext() {
+    for (tls, alpn) in [(false, "[h3]")] {
         let yaml = format!("proxies:\n  - name: invalid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: {tls}\n    alpn: {alpn}\n    network: xhttp\n");
         let config = load_config_from_str(&yaml).await.unwrap();
         assert!(!config.proxies.contains_key("invalid"));
@@ -1766,8 +1766,8 @@ async fn parse_vless_xhttp_rejects_unsupported_http1_alpn() {
         ("[]", true),
         ("[h2]", true),
         ("[http/1.1]", false),
-        ("[h2, http/1.1]", false),
-        ("[custom]", false),
+        ("[h2, http/1.1]", true),
+        ("[custom]", true),
     ] {
         let yaml = format!("proxies:\n  - name: test\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    alpn: {alpn}\n    network: xhttp\n");
         let config = load_config_from_str(&yaml).await.unwrap();
@@ -1781,5 +1781,31 @@ async fn parse_vless_reality_hybrid_flag_is_typed() {
         let yaml = format!("proxies:\n  - name: reality-hybrid\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    tls: true\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\n      short-id: abcd\n      support-x25519mlkem768: {flag}\n");
         let config = load_config_from_str(&yaml).await.unwrap();
         assert_eq!(config.proxies.contains_key("reality-hybrid"), valid);
+    }
+}
+
+#[tokio::test]
+async fn parse_vless_xhttp_h2_download_and_reuse_options() {
+    for (options, accepted) in [
+        ("download-settings: {}", true),
+        ("download-settings: null", true),
+        ("download-settings: {server: other.org, port: 8443, tls: false, reality-opts: {}, host: '', headers: {}, reuse-settings: {}}", true),
+        ("reuse-settings: {}", true),
+        ("reuse-settings: {max-connections: 2, max-concurrency: '3-5', c-max-reuse-times: '0', h-max-request-times: 10, h-max-reusable-secs: '60-120', h-keep-alive-period: -1}", true),
+        ("reuse-settings: {max-concurrency: '3-1'}", false),
+        ("reuse-settings: {h-max-request-times: -1}", false),
+        ("reuse-settings: {max-connections: '2147483648'}", false),
+        ("reuse-settings: {h-keep-alive-period: 9223372036854775807}", false),
+        ("reuse-settings: 2", false),
+        ("download-settings: {server: '', port: 0}", false),
+        ("download-settings: {tls: 'true'}", false),
+        ("download-settings: {alpn: [h3]}", false),
+        ("mode: stream-one\n      download-settings: {}", false),
+        ("download-settings: {headers: {Bad: 2}}", false),
+        ("download-settings: {reality-opts: true}", false),
+    ] {
+        let yaml = format!("proxies:\n  - name: endpoint\n    type: vless\n    server: example.org\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    xhttp-opts:\n      {options}\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(config.proxies.contains_key("endpoint"), accepted, "{options}");
     }
 }

@@ -22,7 +22,8 @@ pub(super) fn connect(
     session: String,
     sender: h2::client::SendRequest<Bytes>,
     response: h2::client::ResponseFuture,
-    driver: tokio::task::JoinHandle<()>,
+    driver: Option<tokio::task::JoinHandle<()>>,
+    owners: Vec<super::SharedOwner>,
 ) -> Box<dyn Stream> {
     let (app, pump) = tokio::io::duplex(BUFFER);
     let (mut read, mut write) = tokio::io::split(pump);
@@ -32,7 +33,9 @@ pub(super) fn connect(
     let task = tokio::spawn(async move {
         // This guard is also dropped on cancellation; never detach a socket
         // driver when an application abandons a pending packet upload.
-        let _driver = super::AbortOnDrop(Some(driver.abort_handle()));
+        let _driver =
+            super::AbortOnDrop(driver.as_ref().map(tokio::task::JoinHandle::abort_handle));
+        let _owners = owners;
         let upload = async {
             let result = upload(&config, &authority, &session, sender, &mut read).await;
             let completion = result.as_ref().map(|_| ()).map_err(copy_error);
@@ -70,7 +73,10 @@ pub(super) fn connect(
 }
 
 fn copy_error(error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), error.to_string())
+    error.raw_os_error().map_or_else(
+        || io::Error::new(error.kind(), error.to_string()),
+        io::Error::from_raw_os_error,
+    )
 }
 
 async fn upload(
@@ -109,7 +115,6 @@ async fn upload(
                 n = read.read(&mut scratch[..capacity]) => {
                     let n = n?;
                     if n == 0 { eof = true; break; }
-                    buffer.reserve_exact(n);
                     buffer.extend_from_slice(&scratch[..n]);
                 }
             }

@@ -8,8 +8,12 @@
 use std::time::Duration;
 
 mod browser;
+mod client;
+pub use client::{ConnectionFactory, XhttpClient, XhttpEndpoint};
 mod packet;
 mod request;
+mod reuse;
+pub use reuse::ReuseConfig;
 
 use async_trait::async_trait;
 use rand::seq::IndexedRandom as _;
@@ -216,110 +220,152 @@ impl XhttpLayer {
 impl Transport for XhttpLayer {
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
         validate_config(&self.config)?;
-
-        let host = self
-            .config
-            .hosts
-            .choose(&mut rand::rng())
-            .cloned()
-            .unwrap_or_else(|| "localhost".to_string());
-        let authority = format_authority(&host);
-        let packet = self
-            .config
-            .effective_mode()
-            .eq_ignore_ascii_case("packet-up");
-        let split = packet
-            || self
-                .config
-                .effective_mode()
-                .eq_ignore_ascii_case("stream-up");
-        let session = split.then(|| generate_session(&self.config));
-        let upload = build_request(
-            &self.config,
-            &authority,
-            self.config
-                .uplink_http_method
-                .parse()
-                .expect("validated method"),
-            session.as_deref(),
-            true,
-        )?;
-        let download = if split {
-            Some(build_request(
-                &self.config,
-                &authority,
-                http::Method::GET,
-                session.as_deref(),
-                false,
-            )?)
-        } else {
-            None
-        };
-
-        // Proxy-sized receive windows — see `h2_common::client_builder`.
-        let (mut h2, conn) = crate::h2_common::client_builder()
+        let (h2, conn) = crate::h2_common::client_builder()
             .handshake::<_, bytes::Bytes>(inner)
             .await
             .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
-
-        let driver_task = tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let _ = conn.await;
         });
-        let mut guard = AbortOnDrop(Some(driver_task.abort_handle()));
-        h2 = ready(h2).await?;
-
-        // Queue GET first so the server creates the session before POST DATA.
-        // Neither response is awaited here: CDN buffering / peers waiting for
-        // the first upload byte must not deadlock the VLESS header write.
-        let download_response = if let Some(request) = download {
-            let (response, _) = h2
-                .send_request(request, true)
-                .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
-            h2 = ready(h2).await?;
-            Some(response)
-        } else {
-            None
-        };
-        if packet {
-            let stream = packet::connect(
-                self.config.clone(),
-                authority,
-                session.expect("packet session"),
-                h2,
-                download_response.expect("packet download"),
-                driver_task,
-            );
-            guard.0 = None;
-            return Ok(stream);
-        }
-        let (upload_response, send_stream) = h2
-            .send_request(upload, false)
-            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
-        let stream = if let Some(download_response) = download_response {
-            H2Stream::new(
-                send_stream,
-                RecvState::with_timeout(
-                    download_response,
-                    Duration::from_secs(15),
-                    crate::h2_common::StatusPolicy::Exact(http::StatusCode::OK),
-                    "xhttp download",
-                ),
-            )
-            .with_auxiliary_recv(RecvState::new(upload_response))
-        } else {
-            H2Stream::new(
-                send_stream,
-                RecvState::with_timeout(
-                    upload_response,
-                    Duration::from_secs(15),
-                    crate::h2_common::StatusPolicy::Success,
-                    "xhttp",
-                ),
-            )
-        };
-        guard.0 = None;
-        Ok(Box::new(stream.with_conn_driver(driver_task)))
+        connect_http2(self.config.clone(), h2, None, Some(driver), Vec::new()).await
     }
+}
+
+pub(super) type SharedOwner = std::sync::Arc<dyn Send + Sync>;
+/// Established HTTP connections can be shared across independently leased tunnels.
+pub(super) async fn connect_http2(
+    mut config: XhttpConfig,
+    h2: h2::client::SendRequest<bytes::Bytes>,
+    mut download: Option<(XhttpConfig, h2::client::SendRequest<bytes::Bytes>)>,
+    driver: Option<tokio::task::JoinHandle<()>>,
+    owners: Vec<SharedOwner>,
+) -> Result<Box<dyn Stream>> {
+    let mut guard = AbortOnDrop(driver.as_ref().map(tokio::task::JoinHandle::abort_handle));
+    if download.is_some()
+        && (config.mode.is_empty() || config.mode.eq_ignore_ascii_case("auto"))
+        && config.has_reality
+    {
+        config.mode = "stream-up".into();
+    }
+    if let Some((cfg, _)) = &download {
+        validate_config(cfg)?;
+        if config.effective_mode().eq_ignore_ascii_case("stream-one") {
+            return Err(TransportError::Config(
+                "xhttp: stream-one cannot use download-settings".into(),
+            ));
+        }
+    }
+    validate_config(&config)?;
+
+    let host = config
+        .hosts
+        .choose(&mut rand::rng())
+        .cloned()
+        .unwrap_or_else(|| "localhost".to_string());
+    let authority = format_authority(&host);
+    let packet = config.effective_mode().eq_ignore_ascii_case("packet-up");
+    let split = packet || config.effective_mode().eq_ignore_ascii_case("stream-up");
+    let session = split.then(|| generate_session(&config));
+    let upload = build_request(
+        &config,
+        &authority,
+        config.uplink_http_method.parse().expect("validated method"),
+        session.as_deref(),
+        true,
+    )?;
+    let download_request = if split {
+        let (download_config, download_authority) = download.as_ref().map_or_else(
+            || (&config, authority.clone()),
+            |(cfg, _)| {
+                (
+                    cfg,
+                    format_authority(
+                        cfg.hosts
+                            .choose(&mut rand::rng())
+                            .expect("validated download host"),
+                    ),
+                )
+            },
+        );
+        Some(build_request(
+            download_config,
+            &download_authority,
+            http::Method::GET,
+            session.as_deref(),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    let mut h2 = ready(h2).await?;
+
+    // Queue GET first so the server creates the session before POST DATA.
+    // Neither response is awaited here: CDN buffering / peers waiting for
+    // the first upload byte must not deadlock the VLESS header write.
+    let download_response = if let Some(request) = download_request {
+        let sender = if let Some((_, sender)) = download.take() {
+            ready(sender).await?
+        } else {
+            h2.clone()
+        };
+        let mut sender = ready(sender).await?;
+        let (response, _) = sender
+            .send_request(request, true)
+            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
+        h2 = ready(h2).await?;
+        Some(response)
+    } else {
+        None
+    };
+    if packet {
+        let stream = packet::connect(
+            config.clone(),
+            authority,
+            session.expect("packet session"),
+            h2,
+            download_response.expect("packet download"),
+            driver,
+            owners.clone(),
+        );
+        guard.0 = None;
+        return Ok(stream);
+    }
+    let (upload_response, send_stream) = h2
+        .send_request(upload, false)
+        .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
+    let stream = if let Some(download_response) = download_response {
+        H2Stream::new(
+            send_stream,
+            RecvState::with_timeout(
+                download_response,
+                Duration::from_secs(15),
+                crate::h2_common::StatusPolicy::Exact(http::StatusCode::OK),
+                "xhttp download",
+            ),
+        )
+        .with_auxiliary_recv(RecvState::new(upload_response))
+    } else {
+        H2Stream::new(
+            send_stream,
+            RecvState::with_timeout(
+                upload_response,
+                Duration::from_secs(15),
+                crate::h2_common::StatusPolicy::Success,
+                "xhttp",
+            ),
+        )
+    };
+    guard.0 = None;
+    let stream = if let Some(driver) = driver {
+        stream.with_conn_driver(driver)
+    } else {
+        stream
+    };
+    Ok(Box::new(HeldStream {
+        inner: Box::new(stream),
+        _owners: owners,
+    }))
 }
 
 async fn ready(
@@ -526,6 +572,41 @@ fn is_header_token_byte(b: u8) -> bool {
                 | b'|'
                 | b'~'
         )
+}
+
+struct HeldStream {
+    inner: Box<dyn Stream>,
+    _owners: Vec<SharedOwner>,
+}
+impl tokio::io::AsyncRead for HeldStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for HeldStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]

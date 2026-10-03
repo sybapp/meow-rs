@@ -7,10 +7,12 @@ the whole meow kernel, or even every VLESS transport setting, equals mihomo.
 
 | Area | Implemented and covered | Remaining differences |
 | --- | --- | --- |
-| XHTTP modes | H2/h2c and H3 `stream-one`, `stream-up`, `packet-up`; omitted/empty `mode` uses `auto` | HTTP/1.1 transport; independently configured download endpoints |
-| Auto selection | Plain TLS/h2c/H3 chooses `packet-up`; REALITY chooses `stream-one` | REALITY + download settings should choose `stream-up` when download settings are implemented |
+| XHTTP modes | H2/h2c and H3 `stream-one`, `stream-up`, `packet-up`; omitted/empty `mode` uses `auto` | HTTP/1.1 transport; H3 download endpoints and mixed H2/H3 endpoints |
+| Auto selection | Plain TLS/h2c/H3 chooses `packet-up`; REALITY chooses `stream-one` or `stream-up` with independent H2 download | H3 independent download selection |
 | Metadata | Path/query/header/cookie sessions and sequence numbers; configurable upload method | Reserved methods still depend on peer support (mihomo server treats GET as download) |
-| Packet upload | Finite requests, monotonic sequence, timer/size flushing, bounded serial acknowledgement, shutdown flush | No connection reuse manager/XMUX; no HTTP/1.1 request pool |
+| H2 endpoints | Independent server/port, TLS/SNI/fingerprint/ECH, trust name, certificate pin, mTLS; parent inheritance with null/empty-map semantics; app-protected dialer and probe flags | H3 or HTTP/1.1 endpoints; ShadowTLS/RESTLS/JLS security wiring; DNS-sourced download ECH |
+| H2 reuse | Logical-tunnel limits, preferred transport width, concurrency overflow, requests/reuses/expiry, 300 s idle retirement; probe isolation, reset and GOAWAY preserve accepted streams; 45 s default heartbeat or signed keep-alive period | Other HTTP backends; same entry can remain eligible after expiry while active (matching pinned upstream) |
+| Packet upload | Finite requests, monotonic sequence, timer/size flushing, bounded serial acknowledgement, shutdown flush | H2 XMUX manager implemented; H3 XMUX and HTTP/1.1 request pool remain absent |
 | Payload | Body/auto, header and cookie; unpadded URL-safe Base64 chunking | Header/cookie packets use a conservative 8 KiB raw payload cap |
 | Padding | Repeat-X/tokenish, header/queryInHeader/query/cookie; metadata applied after padding; process-sampled browser header/UA presets | Full browser ClientHello profiles (HTTP headers are implemented) |
 | Sessions | Legacy hex, UUID, all nine predefined tables and custom ASCII alphabets; upstream entropy threshold | Allocation and unsafe header/cookie byte restrictions below |
@@ -51,8 +53,15 @@ options are rejected instead of silently changing their meaning:
   Buffers grow on demand. Header/cookie payloads are flushed in at most 8 KiB
   chunks to keep HTTP field sizes practical. This changes batching, preserving
   the byte stream and sequence semantics.
-- Explicit XHTTP ALPN must be exclusively `h2` or `h3`. HTTP/1.1 and mixed
-  protocol lists are rejected until the corresponding backend exists.
+- Exact singleton `h3` selects QUIC and requires TLS; exact singleton
+  `http/1.1` remains rejected. Other ALPN lists use forced H2, matching mihomo.
+  Independent download endpoints currently require the H2 backend.
+- Reuse ranges are ordered nonnegative values capped at `i32::MAX`;
+  keep-alive periods must fit a signed Go nanosecond duration.
+- Client identities are limited to 1 MiB and loaded at configuration time.
+  Automatic identity-file rotation is not implemented; reload the configuration.
+- A single relay-supplied TCP stream cannot carry independent download endpoints;
+  such relays fail explicitly. Use `dialer-proxy` for multiple protected dials.
 - There is one unacknowledged upload packet per logical tunnel. Both backends
   apply backpressure; H3 may hold one additional bounded accumulation buffer.
   H2 times out a stalled packet send/acknowledgement after 15 seconds.
@@ -86,13 +95,26 @@ MEOW_XHTTP_PEER_BIN=/tmp/mihomo-xhttp-peer cargo test -p meow-transport \
   --features xhttp3,reality --test xhttp_mihomo_interop
 ```
 
-CI builds the peer and requires this suite. Missing peer binaries fail loudly.
+The peer can expose two separate H2 frontends over one upstream session handler;
+request captures validate endpoint routing without duplicating the Rust builder.
+The real config-to-VLESS adapter suite additionally decodes a synthetic VLESS TCP
+request and verifies shared user connections, isolated probes, SNI overrides,
+certificate pins and mutual TLS. A wrong pin fails before any HTTP request.
+
+```sh
+MEOW_XHTTP_PEER_BIN=/tmp/mihomo-xhttp-peer cargo test -p meow-config \
+  --test vless_xhttp_endpoint_interop
+```
+
+CI builds the peer and requires both suites. Missing peer binaries fail loudly.
 Actual node tests remain opt-in; credentials must stay outside committed files.
 
 ## Working scope
 
 The iOS work is paused. Existing device/simulator build files are retained, but
 this work does not add device, NetworkExtension, RSS/OOM or battery validation.
-HTTP/1.1, independently configured download endpoints, and reusable HTTP
-transport pools are still absent from this committed increment. No previous
-uncommitted prototype is counted as implemented compatibility here.
+HTTP/1.1, H3 reuse/download and mixed-version endpoints still need implementation.
+H2 reuse/download is integrated into the VLESS TCP/UDP and mux dial paths;
+configuration-to-adapter interop checks assert physical connection counts, SNI,
+pinning and mutual TLS against the independent peer. No previous uncommitted
+prototype is counted as implemented compatibility here.
